@@ -117,6 +117,9 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Only meaningful for PP > 1 on the V1 engine; incompatible with
     # speculative decoding. Not sensitive.
     "TRIO_PP_MICROBATCH": lambda: int(os.getenv("TRIO_PP_MICROBATCH", "0")),
+    # TrioSLO hetero emulation: replay the forward on the last PP stage
+    # (half-blood card: half compute, half HBM bandwidth).
+    "TRIO_HETERO_REPLAY": lambda: int(os.getenv("TRIO_HETERO_REPLAY", "0")),
 }
 
 # end-env-vars-definition

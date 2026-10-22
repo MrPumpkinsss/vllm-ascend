@@ -22,6 +22,11 @@ import gc
 import logging
 from types import NoneType
 
+# TrioSLO hetero emulation: read once at import; worker processes inherit
+# the env from the wrapper (python -m trioslo.serve keeps __main__, so all
+# spawned processes re-apply this).
+_TRIO_HETERO_REPLAY = __import__("os").environ.get("TRIO_HETERO_REPLAY", "0") == "1"
+
 import torch
 import torch.nn as nn
 import torch_npu
@@ -645,6 +650,18 @@ class NPUWorker(WorkerBase):
             self.profiler.step()
 
         output = self.model_runner.execute_model(scheduler_output, intermediate_tensors)
+        # TrioSLO hetero emulation (half-blood card): replay the whole
+        # forward once on the LAST pipeline stage, doubling both compute
+        # and memory traffic on that stage -- a faithful software emulation
+        # of a card with half the AI cores and half the HBM bandwidth
+        # (sleep would fake wall time but leave the card idle, which
+        # duty-cycle probes would expose).  Pair with
+        # VLLM_PP_LAYER_PARTITION="32,16" so both stages take equal time.
+        # The stock engine's cross-batch stage overlap is untouched:
+        # send/recv handshakes happen exactly as before, only this stage's
+        # forward duration doubles.  Off unless TRIO_HETERO_REPLAY=1.
+        if _TRIO_HETERO_REPLAY and get_pp_group().is_last_rank:
+            _ = self.model_runner.execute_model(scheduler_output, intermediate_tensors)
         if isinstance(output, (ModelRunnerOutput, AsyncModelRunnerOutput, NoneType)):
             return output
 
