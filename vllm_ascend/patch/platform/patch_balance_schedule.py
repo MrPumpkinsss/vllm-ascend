@@ -742,4 +742,11 @@ def run_engine_core(*args, dp_rank: int = 0, local_dp_rank: int = 0, **kwargs):
 
 
 EngineCoreProc.run_engine_core = run_engine_core
+# TrioSLO: keep the pristine upstream Scheduler reachable.  The global swap
+# below hides it: any custom `--scheduler-cls` implementation that wants to
+# subclass the REAL engine scheduler finds BalanceScheduler instead, and
+# inspect.getsource() then returns this file's (older, copied) schedule()
+# body rather than upstream's.  VanillaScheduler is the escape hatch; the
+# swap itself is unchanged.
+vllm.v1.core.sched.scheduler.VanillaScheduler = _ORIGINAL_SCHEDULER
 vllm.v1.core.sched.scheduler.Scheduler = BalanceScheduler
