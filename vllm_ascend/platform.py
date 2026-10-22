@@ -724,6 +724,17 @@ class NPUPlatform(Platform):
             )
             import vllm_ascend.patch.platform.patch_profiling_chunk  # noqa
 
+        # TrioSLO: PP decode-parity microbatching. The patch self-applies on
+        # import against the vanilla Scheduler (see patch_trioslo_microbatch).
+        from vllm_ascend import envs as _trio_envs
+
+        if (
+            int(_trio_envs.TRIO_PP_MICROBATCH) > 1
+            and parallel_config.pipeline_parallel_size > 1
+            and not vllm_config.scheduler_config.num_speculative_tokens
+        ):
+            import vllm_ascend.patch.platform.patch_trioslo_microbatch  # noqa
+
         cp_size = parallel_config.decode_context_parallel_size * parallel_config.prefill_context_parallel_size
         use_sparse = model_uses_sfa_sparse(model_config)
         sfa_dcp_replicated_indexer = enable_sfa_dcp_replicated_indexer(vllm_config)

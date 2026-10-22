@@ -110,6 +110,13 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Control the aclrtMemcpyBatchAsync compile path for KV cache offloading.
     # "1": force enable, "0": force disable, None: auto-detect from CANN headers.
     "VLLM_ASCEND_ENABLE_BATCH_MEMCPY": lambda: os.getenv("VLLM_ASCEND_ENABLE_BATCH_MEMCPY", None),
+    # TrioSLO: pipeline-parallel decode-parity microbatching. Set equal to
+    # --pipeline-parallel-size (e.g. 2) to partition decode requests into pp
+    # parity groups so consecutive in-flight SchedulerOutputs are disjoint
+    # and the PP batch queue actually overlaps the stages. 0 or 1 disables.
+    # Only meaningful for PP > 1 on the V1 engine; incompatible with
+    # speculative decoding. Not sensitive.
+    "TRIO_PP_MICROBATCH": lambda: int(os.getenv("TRIO_PP_MICROBATCH", "0")),
 }
 
 # end-env-vars-definition
