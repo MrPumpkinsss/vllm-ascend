@@ -15,6 +15,15 @@ microbatches, and stage0/stage1 run serialized - on CodeLlama-34B/PP=2 the
 measured decode floor (57.8 ms) is exactly the serial sum of the two
 stages' weight reads.
 
+MEASURED OUTCOME (0.23.0 wheel, 34B/PP=2, 2026-10-22)
+-----------------------------------------------------
+REGRESSION, do not enable on this build: instrumented workers show stock
+ALREADY pipelines across batches (rank1 computes batch N during rank0's
+batch N+1 for ~80% of its forward time), so each batch already amortises
+the full weight read across ALL riders.  Parity gating halves per-request
+decode cadence without shrinking per-batch weight-read cost: TPOT doubled
+at every concurrency.  See TRIOSLO.md "MEASURED CORRECTION".
+
 What it does
 ------------
 Decode requests are partitioned into ``pp`` parity groups; only group

@@ -70,3 +70,28 @@ the offline test suite in `TrioSLO/trioslo/tests/`.
 
 - `trioslo-v0.23.0` — working branch, based on upstream tag `v0.23.0`
 - `upstream` remote points at `vllm-project/vllm-ascend`
+
+## MEASURED CORRECTION (2026-10-22, wheel 0.23.0, 34B/PP=2, instrumented workers)
+
+Worker-level timeline instrumentation (`NPUWorker.execute_model` stamps:
+enter / pp-wait-done / forward-done / sent) **overturns the premise** of the
+microbatch patch above:
+
+* **Stock already pipelines across batches.** Rank1 spends **79-80%** of its
+  forward compute concurrent with rank0's NEXT batch (measured at D=1 and
+  D=8). The "serial staircase" model was wrong; `TPOT(D) = 57.4 + 0.39*D`
+  decomposes as **one** stage's weight read (~48 ms) + engine inter-batch
+  gap (~9-11 ms) + rider compute - NOT 2 x 28.7.
+* **The parity-gate microbatch is strictly harmful here**: it halves each
+  request's decode cadence (token every 2 batches) while every batch still
+  pays the full ~48 ms weight read. Measured TPOT ~= 2x stock at every D
+  (D=1: 100.8 vs 57.4; D=8: 118 vs 60.8; D=64: 141 vs 80.8).
+* The PP send-wait-at-top is **not** a serialization point (0.3 ms median).
+
+`patch_trioslo_microbatch.py` is kept for the record and for engines where
+the batch queue genuinely runs one-batch-deep, but on this build it must
+stay OFF.  The real per-step levers measured on this engine:
+
+1. the ~9-11 ms engine inter-batch gap (16-19% of TPOT at low D),
+2. per-class batch composition (TTFT/ITL differentiation),
+3. the ~48 ms weight-read floor itself (quantization/TP only).
