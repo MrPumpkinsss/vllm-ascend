@@ -19,6 +19,7 @@
 
 import logging
 import math
+import os
 import sys
 import time
 from collections import defaultdict
@@ -102,6 +103,12 @@ from vllm.v1.worker.ubatch_utils import (
 from vllm.v1.worker.utils import AttentionGroup, select_common_block_size
 
 # yapf: enable
+
+# Replay only the model body on the last PP stage.  This must NOT call
+# execute_model() twice: vLLM's async scheduler requires sample_tokens()
+# between execute_model() calls.
+_TRIO_HETERO_REPLAY = os.environ.get("TRIO_HETERO_REPLAY", "0") == "1"
+
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.attention_v1 import AscendAttentionBackend, AscendAttentionState
 from vllm_ascend.attention.context_parallel.dsa_cp import AscendDSACPMetadataBuilder
@@ -2320,6 +2327,14 @@ class NPUModelRunner(GPUModelRunner):
             hidden_states = self._model_forward(
                 num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
             )
+            # TrioSLO half-card emulation: duplicate the model body only.
+            # KV slots are rewritten with identical values, while scheduler
+            # state, async-sampling state, and PP handshakes remain single-shot.
+            if _TRIO_HETERO_REPLAY and get_pp_group().is_last_rank:
+                _ = self._model_forward(
+                    num_tokens_padded, input_ids, positions,
+                    intermediate_tensors, inputs_embeds, **model_kwargs,
+                )
         with record_function_or_nullcontext("post process"):
             aux_hidden_states = None
             if self.use_aux_hidden_state_outputs:
