@@ -17,6 +17,7 @@
 # Adapted from vllm-project/vllm/vllm/worker/gpu_model_runner.py
 #
 
+import json
 import logging
 import math
 import os
@@ -108,6 +109,7 @@ from vllm.v1.worker.utils import AttentionGroup, select_common_block_size
 # execute_model() twice: vLLM's async scheduler requires sample_tokens()
 # between execute_model() calls.
 _TRIO_HETERO_REPLAY = os.environ.get("TRIO_HETERO_REPLAY", "0") == "1"
+_TRIO_PROFILE_TRACE = os.environ.get("TRIO_PROFILE_PATH", "")
 
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.attention_v1 import AscendAttentionBackend, AscendAttentionState
@@ -604,6 +606,25 @@ class NPUModelRunner(GPUModelRunner):
         self.mamba_state_idx: dict[str, int] = {}
         self._mamba_bufs: Any | None = None
         self._mamba_copy_bufs: Any | None = None
+
+        # Profile-only model-body timing.  Each PP rank owns a separate file;
+        # profile_real.py pairs records by sequence/composition and takes the
+        # bottleneck-stage duration.  Leaving TRIO_PROFILE_PATH unset keeps
+        # normal serving allocation- and synchronization-free.
+        self._trio_profile_trace = ""
+        self._trio_profile_fh = None
+        self._trio_profile_seq = 0
+        self._trio_profile_pp_rank = 0
+        if _TRIO_PROFILE_TRACE:
+            try:
+                self._trio_profile_pp_rank = get_pp_group().rank_in_group
+            except Exception:
+                self._trio_profile_pp_rank = 0
+            stem = _TRIO_PROFILE_TRACE
+            if stem.endswith(".jsonl"):
+                stem = stem[:-6]
+            self._trio_profile_trace = f"{stem}.rank{self._trio_profile_pp_rank}.jsonl"
+            self._trio_profile_fh = open(self._trio_profile_trace, "a", encoding="utf-8")
         self.enable_hamming_sparse = (self.ascend_config.enable_hamming_sparse is True)
         self.enable_hamming_sparse = self.enable_hamming_sparse and not vllm_config.speculative_config
         if self.enable_hamming_sparse is True:
@@ -1953,6 +1974,36 @@ class NPUModelRunner(GPUModelRunner):
                 self.draft_token_ids_cpu[:num_reqs] = 0
             self.draft_token_ids_event.record()
 
+    def _trio_profile_composition(
+        self, scheduler_output: "SchedulerOutput", req_ids, num_reqs: int
+    ) -> tuple[int, int, int]:
+        """Return (prefill tokens, decode riders, decode context sum).
+
+        The values are read after input-state update and before the model
+        body, so ``num_computed_tokens_cpu`` is the context preceding this
+        forward.  This is the same accounting used by the simulator.
+        """
+        prefill_tokens = 0
+        decode_riders = 0
+        decode_ctx_sum = 0
+        for req_index, req_id in enumerate(req_ids[:num_reqs]):
+            scheduled = int(scheduler_output.num_scheduled_tokens.get(req_id, 0))
+            if scheduled <= 0:
+                continue
+            computed = int(self.input_batch.num_computed_tokens_cpu[req_index])
+            prompt_len = int(self.input_batch.num_prompt_tokens[req_index])
+            if computed < prompt_len:
+                prefill_tokens += scheduled
+            else:
+                decode_riders += 1
+                decode_ctx_sum += computed
+        return prefill_tokens, decode_riders, decode_ctx_sum
+
+    def _trio_profile_write(self, record: dict[str, Any]) -> None:
+        assert self._trio_profile_fh is not None
+        self._trio_profile_fh.write(json.dumps(record, separators=(",", ":")) + "\n")
+        self._trio_profile_fh.flush()
+
     @torch.inference_mode()
     def execute_model(
         self,
@@ -2324,17 +2375,59 @@ class NPUModelRunner(GPUModelRunner):
         ):
             if self.cache_config.mamba_cache_mode == "align":
                 mamba_utils.do_mamba_copy_block(preprocess_bufs)
+            profile_body = self._trio_profile_fh is not None
+            if profile_body:
+                prefill_tokens, decode_riders, decode_ctx_sum = (
+                    self._trio_profile_composition(scheduler_output, req_ids, num_reqs)
+                )
+                self._trio_profile_seq += 1
+                # Synchronize only in the opt-in profiling build.  NPU events
+                # measure stream time without CPU timestamp quantization; the
+                # explicit end synchronization makes the record immediately
+                # available to the profiler.
+                torch.npu.synchronize()
+                profile_wall_start = time.perf_counter()
+                profile_ts_start = time.time()
+                profile_start_event = torch.npu.Event(enable_timing=True)
+                profile_end_event = torch.npu.Event(enable_timing=True)
+                profile_start_event.record()
+
             hidden_states = self._model_forward(
                 num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
             )
             # TrioSLO half-card emulation: duplicate the model body only.
             # KV slots are rewritten with identical values, while scheduler
             # state, async-sampling state, and PP handshakes remain single-shot.
-            if _TRIO_HETERO_REPLAY and get_pp_group().is_last_rank:
+            hetero_replay = _TRIO_HETERO_REPLAY and get_pp_group().is_last_rank
+            if hetero_replay:
                 _ = self._model_forward(
                     num_tokens_padded, input_ids, positions,
                     intermediate_tensors, inputs_embeds, **model_kwargs,
                 )
+
+            if profile_body:
+                profile_end_event.record()
+                profile_end_event.synchronize()
+                profile_wall_ms = (time.perf_counter() - profile_wall_start) * 1000.0
+                profile_npu_ms = float(profile_start_event.elapsed_time(profile_end_event))
+                self._trio_profile_write({
+                    "schema": "trioslo-model-trace-v1",
+                    "seq": self._trio_profile_seq,
+                    "pp_rank": self._trio_profile_pp_rank,
+                    "ts_start": profile_ts_start,
+                    "ts_end": time.time(),
+                    "wall_ms": round(profile_wall_ms, 6),
+                    "npu_ms": round(profile_npu_ms, 6),
+                    "prefill_tokens": prefill_tokens,
+                    "decode_riders": decode_riders,
+                    "decode_ctx_sum": decode_ctx_sum,
+                    "num_tokens_padded": int(num_tokens_padded),
+                    "total_num_scheduled_tokens": int(
+                        scheduler_output.total_num_scheduled_tokens
+                    ),
+                    "hetero_replay": bool(hetero_replay),
+                    "clock": "npu-event",
+                })
         with record_function_or_nullcontext("post process"):
             aux_hidden_states = None
             if self.use_aux_hidden_state_outputs:
