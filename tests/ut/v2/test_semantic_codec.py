@@ -14,9 +14,10 @@ def test_semantic_boundary_is_bitwise_exact():
     target = torch.randn((3, 5120), generator=generator, dtype=torch.float32).to(torch.bfloat16)
     with tempfile.TemporaryDirectory() as directory:
         path = Path(directory) / "tables.npz"
-        config = SemanticCodecConfig(calibration_path=str(path))
-        codec = SemanticBoundaryCodec(config)
+        codec = SemanticBoundaryCodec(SemanticCodecConfig())
         codec.residual.fit([calibration]).save(path)
+        # A transport-created codec loads the pre-shared tables from disk.
+        SemanticBoundaryCodec(SemanticCodecConfig(calibration_path=str(path)))
         anchor, residual, _ = codec.encode("hidden_states", target)
         recovered = codec.decode(target.shape, target.dtype, target.device, anchor, residual)
         assert torch.equal(recovered, target)

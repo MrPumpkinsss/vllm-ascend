@@ -310,7 +310,7 @@ def fit_calibration_archive(archive_path: str | Path, output_path: str | Path) -
                 .view(torch.bfloat16)
                 .reshape(expected, SemanticCodecConfig().hidden_size)
             )
-        config = SemanticCodecConfig(calibration_path=str(output_path))
+        config = SemanticCodecConfig()
         ExactRankDeltaResidual(config).fit(samples).save(output_path)
         return sum(sample.numel() for sample in samples)
 
