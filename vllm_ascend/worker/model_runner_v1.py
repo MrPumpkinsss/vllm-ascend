@@ -2509,6 +2509,28 @@ class NPUModelRunner(GPUModelRunner):
         return None
 
     @torch.inference_mode()
+    def _pp_broadcast_prev_sampled_token_ids(
+        self, sampled_token_ids: torch.Tensor
+    ) -> None:
+        """Broadcast only the committed bonus token for async PP+MTP.
+
+        Upstream PP+async assumes the sampler returns ``[num_reqs, 1]``.  With
+        speculative decoding, the last-stage sampler may return the committed
+        block in the first column followed by rejected/speculative slots.  The
+        first PP stage still needs only the first committed token here; draft
+        token ids continue to follow their existing proposer/scheduler path.
+        """
+        pp = get_pp_group()
+        assert pp.is_last_rank
+        if sampled_token_ids.dim() != 2 or sampled_token_ids.shape[0] == 0:
+            raise ValueError(
+                "expected sampled_token_ids with shape [num_reqs, k], got "
+                f"{tuple(sampled_token_ids.shape)}"
+            )
+        committed = sampled_token_ids[:, :1].contiguous()
+        if not self._is_all_reqs_chunked_prefill():
+            torch.distributed.broadcast(committed, src=pp.rank, group=pp.device_group)
+
     def sample_tokens(
         self, grammar_output: "GrammarOutput | None"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors:
