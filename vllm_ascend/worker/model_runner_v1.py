@@ -2527,7 +2527,7 @@ class NPUModelRunner(GPUModelRunner):
                 "expected sampled_token_ids with shape [num_reqs, k], got "
                 f"{tuple(sampled_token_ids.shape)}"
             )
-        committed = sampled_token_ids[:, :1].contiguous()
+        committed = sampled_token_ids[:, :1].to(dtype=torch.int32).contiguous()
         if not self._is_all_reqs_chunked_prefill():
             torch.distributed.broadcast(committed, src=pp.rank, group=pp.device_group)
 
