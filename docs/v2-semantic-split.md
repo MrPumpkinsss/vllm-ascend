@@ -64,3 +64,23 @@ export VLLM_ASCEND_V2_CONNECT=127.0.0.1:29600
 
 Start vLLM with `--pipeline-parallel-size 2`. Stage A connects to stage B over
 the configured TCP endpoint while retaining vLLM's normal PP scheduling and MTP.
+
+## Status measured on Ascend 910B3 (2026-10-25)
+
+- The residual codec recovered all 23 E12 BF16 blocks bitwise. Wire payload was
+  1,433,261 B versus 1,884,160 B BF16 (23.93% reduction), excluding the
+  pre-shared 2.0 MiB Huffman table.
+- A PP2/no-spec vLLM server completed an 8-token greedy request through the TCP
+  semantic boundary. Its first boundary message was 82,350 B versus 102,400 B
+  BF16 (19.58% reduction).
+- PP2+MTP still reaches an upstream scheduling incompatibility. With async PP,
+  the sampler attempts a direct sample-token broadcast while the first stage is
+  not ready; with synchronous PP, rejection-sampler bookkeeping feeds negative
+  draft placeholders into an Ascend indexing kernel (`index value -7`). This is
+  the next scheduler-level blocker; the semantic boundary itself has completed
+  its first prefill transfer.
+- A separate two-NPU fused-batch probe showed `VV(t)+DV(t+1)` is not bitwise
+  logits/cache invariant relative to a separate T-token forward. On the probed
+  block, max logit difference was 0.2578125, argmax matched, logits were not
+  bitwise equal, and suffix cache states were not bitwise equal. Committed
+  greedy tokens still matched the split baseline in that probe.
