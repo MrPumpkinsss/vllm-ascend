@@ -55,6 +55,7 @@ from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
 from vllm.v1.worker.workspace import init_workspace_manager
 
 import vllm_ascend.envs as envs_ascend
+from vllm_ascend.v2.tcp_transport import SemanticPPTransport
 from vllm_ascend.ascend_config import get_ascend_config, init_ascend_config
 from vllm_ascend.batch_invariant import init_batch_invariance
 from vllm_ascend.cpu_binding import bind_cpus
@@ -162,6 +163,18 @@ class NPUWorker(WorkerBase):
             logger.warning("VLLM_USE_V2_MODEL_RUNNER is not supported on vllm 0.23.0; falling back to v1 model runner.")
             self.use_v2_model_runner = False
         self._pp_send_work: list[Handle] = []
+
+        # Experimental V2 split-computing path. PP2 replaces HCCL at the single
+        # intermediate-tensor boundary with semantic anchor + exact residual.
+        self.v2_semantic_pp: SemanticPPTransport | None = None
+        if self.vllm_config.parallel_config.pipeline_parallel_size == 2:
+            self.v2_semantic_pp = SemanticPPTransport.from_env(
+                sender=get_pp_group().is_first_rank
+            )
+        elif "VLLM_ASCEND_V2_SEMANTIC_PP" in os.environ:
+            logger.warning(
+                "V2 semantic PP transport currently supports only PP=2; using native HCCL."
+            )
 
         ascend_compilation_config = get_ascend_config().ascend_compilation_config
         if ascend_compilation_config.enable_npugraph_ex and ascend_compilation_config.enable_static_kernel:
@@ -625,15 +638,19 @@ class NPUWorker(WorkerBase):
         intermediate_tensors = None
         forward_pass = scheduler_output.total_num_scheduled_tokens > 0
         if forward_pass and not get_pp_group().is_first_rank:
-            # If flashcomm1 is used, this all_gather_group parameter needs to be removed, otherwise
-            # it will conflict with the all-gather operation in flashcomm1.
-            if enable_sp():
-                all_gather_group = None
+            if self.v2_semantic_pp is not None:
+                tensor_dict = self.v2_semantic_pp.recv_tensor_dict()
+                comm_handles, comm_postprocess = [], []
             else:
-                all_gather_group = get_tp_group()
-            tensor_dict, comm_handles, comm_postprocess = get_pp_group().irecv_tensor_dict(
-                all_gather_group=all_gather_group
-            )
+                # If flashcomm1 is used, this all_gather_group parameter needs to be removed, otherwise
+                # it will conflict with the all-gather operation in flashcomm1.
+                if enable_sp():
+                    all_gather_group = None
+                else:
+                    all_gather_group = get_tp_group()
+                tensor_dict, comm_handles, comm_postprocess = get_pp_group().irecv_tensor_dict(
+                    all_gather_group=all_gather_group
+                )
             assert tensor_dict is not None
             intermediate_tensors = AsyncIntermediateTensors(
                 tensor_dict,
@@ -657,10 +674,17 @@ class NPUWorker(WorkerBase):
             all_gather_group = None
         else:
             all_gather_group = get_tp_group()
-        self._pp_send_work = get_pp_group().isend_tensor_dict(
-            output.tensors,
-            all_gather_group=all_gather_group,
-        )
+        if self.v2_semantic_pp is not None:
+            self.v2_semantic_pp.send_tensor_dict(output.tensors)
+            self._pp_send_work = []
+            stats = self.v2_semantic_pp.stats()
+            if stats["messages"] % 10 == 1:
+                logger.info("V2 semantic PP boundary stats: %s", stats)
+        else:
+            self._pp_send_work = get_pp_group().isend_tensor_dict(
+                output.tensors,
+                all_gather_group=all_gather_group,
+            )
 
         kv_connector_output = output.kv_connector_output
         if not kv_connector_output:
