@@ -167,11 +167,10 @@ class NPUWorker(WorkerBase):
         # Experimental V2 split-computing path. PP2 replaces HCCL at the single
         # intermediate-tensor boundary with semantic anchor + exact residual.
         self.v2_semantic_pp: SemanticPPTransport | None = None
-        if self.vllm_config.parallel_config.pipeline_parallel_size == 2:
-            self.v2_semantic_pp = SemanticPPTransport.from_env(
-                sender=get_pp_group().is_first_rank
-            )
-        elif "VLLM_ASCEND_V2_SEMANTIC_PP" in os.environ:
+        if (
+            self.vllm_config.parallel_config.pipeline_parallel_size != 2
+            and "VLLM_ASCEND_V2_SEMANTIC_PP" in os.environ
+        ):
             logger.warning(
                 "V2 semantic PP transport currently supports only PP=2; using native HCCL."
             )
@@ -1024,6 +1023,11 @@ class NPUWorker(WorkerBase):
         )
         init_ascend_model_parallel(self.parallel_config)
         ensure_ec_transfer_initialized(self.vllm_config)
+
+        if self.vllm_config.parallel_config.pipeline_parallel_size == 2:
+            self.v2_semantic_pp = SemanticPPTransport.from_env(
+                sender=get_pp_group().is_first_rank
+            )
 
     def get_supported_pooling_tasks(self):
         return self.model_runner.get_supported_pooling_tasks()
