@@ -440,6 +440,16 @@ class NPUPlatform(Platform):
         if kv_transfer_config is not None and getattr(kv_transfer_config, "kv_role", None) == "kv_producer":
             return
 
+        if (
+            os.environ.get("VLLM_ASCEND_V2_SEMANTIC_PP", "0") == "1"
+            and parallel_config.pipeline_parallel_size == 2
+        ):
+            logger.warning(
+                "Allowing experimental V2 PP=2 semantic-boundary MTP; this is "
+                "not covered by upstream PD-disaggregated PP+MTP validation."
+            )
+            return
+
         raise ValueError(
             "PP+MTP is only supported on PD-disaggregated P nodes "
             "(kv_role='kv_producer'). D nodes must use "
