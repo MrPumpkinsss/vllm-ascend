@@ -13,6 +13,14 @@ downstream MTP state. The `prefix_shadow_full` diagnostic commits the
 full-residual result and compares the partial path from the same saved cache
 snapshot. It is intended for debugging, not benchmarking.
 
+The opt-in `experimental_fix_mtp_padding` diagnostic adjusts the next MTP
+drafting steps' sequence lengths after rejected padded rows. In one 16-request
+workload, corrected P4 and P8 token IDs and acceptance traces match in both
+draft-eager and full-graph modes. The correction changes the original padded
+trajectory, is restricted to one request without context parallelism,
+synchronizes counts to the CPU, and has no general correctness or performance
+guarantee.
+
 The A-side optimistic runahead and a real fused `VV(t)+DV(t+1)` engine batch
 are not implemented. Existing codec, socket, and limited engine checks do not
 constitute a general exactness or performance guarantee. The experimental

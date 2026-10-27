@@ -53,6 +53,7 @@ from vllm_ascend.models.llama_eagle3_vwn import Eagle3VwnLlamaForCausalLM
 from vllm_ascend.ops.triton.spec_decode.utils import prepare_inputs_padded_kernel
 from vllm_ascend.ops.triton.triton_utils import get_vectorcore_num
 from vllm_ascend.utils import check_gdn_layer, enable_sp, lmhead_tp_enable, shared_expert_dp_enabled
+from vllm_ascend.v3.mtp_metadata import accepted_draft_metadata
 from vllm_ascend.worker.utils import copy_snapshot_to_gpu
 
 
@@ -967,6 +968,19 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                     ori_seq_len_cpu=pcp_mtp_inputs.seq_lens_cpu,
                     slot_indices=pcp_mtp_inputs.slot_indices,
                     mtp_slot_mapping=pcp_mtp_inputs.slot_mapping,
+                )
+
+        v3_config = (self.vllm_config.additional_config or {}).get("v3_verdict_adaptive", {})
+        if (
+            isinstance(v3_config, dict)
+            and v3_config.get("experimental_fix_mtp_padding", False)
+            and self.method == "mtp"
+        ):
+            if num_rejected_tokens_gpu is not None:
+                if batch_size != 1 or self.pcp_size * self.dcp_size != 1 or self.parallel_drafting:
+                    raise RuntimeError("experimental V3 MTP padding correction supports only one non-CP request")
+                common_attn_metadata = accepted_draft_metadata(
+                    common_attn_metadata, num_rejected_tokens_gpu, batch_size
                 )
 
         should_update_next_steps = not self.parallel_drafting and (
