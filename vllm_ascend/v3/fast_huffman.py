@@ -68,6 +68,11 @@ def _load_native():
             ctypes.c_uint16,
         ]
         lib.huff_decode.restype = ctypes.c_int64
+        lib.huff_encode_rows.argtypes = [
+            u32, u8, i64, u16, u16, ctypes.c_int64, ctypes.c_int64,
+            u8, ctypes.c_int64, ctypes.c_uint16, i64,
+        ]
+        lib.huff_encode_rows.restype = ctypes.c_int64
         return lib
     except OSError:
         return None
@@ -120,7 +125,7 @@ class NativeHuffmanCodec:
             if not row:
                 continue
             starts, ends, values = zip(*row)
-            offset = context * max_count
+            offset = int(self.long_offsets[context])
             self.long_starts[offset : offset + len(row)] = starts
             self.long_ends[offset : offset + len(row)] = ends
             self.long_values[offset : offset + len(row)] = values
@@ -154,6 +159,49 @@ class NativeHuffmanCodec:
         if bits < 0:
             raise RuntimeError(f"native V3 Huffman encoder error {bits}")
         return output[: (bits + 7) // 8].copy()
+
+    def encode_rows(
+        self,
+        context: np.ndarray,
+        symbols: np.ndarray,
+        exact_codes: np.ndarray,
+        row_elements: int,
+    ) -> list[bytes]:
+        context = np.ascontiguousarray(context, dtype=np.int64)
+        symbols = np.ascontiguousarray(symbols, dtype=np.uint16)
+        exact_codes = np.ascontiguousarray(exact_codes, dtype=np.uint16)
+        if not self.available:
+            raise RuntimeError("native V3 Huffman row encoder unavailable")
+        num_rows = int(len(context) // row_elements)
+        if num_rows * row_elements != len(context):
+            raise ValueError("context length is not divisible by row_elements")
+        capacity_bits = len(context) * (self.max_code_length + 16) + num_rows * 8
+        output = np.zeros((capacity_bits + 7) // 8, dtype=np.uint8)
+        row_bits = np.empty(num_rows, dtype=np.int64)
+        total_bits = int(
+            self.native.huff_encode_rows(
+                self.code_values,
+                self.code_lengths,
+                context,
+                symbols,
+                exact_codes,
+                row_elements,
+                num_rows,
+                output,
+                capacity_bits,
+                self.escape_symbol,
+                row_bits,
+            )
+        )
+        if total_bits < 0:
+            raise RuntimeError(f"native V3 Huffman row encoder error {total_bits}")
+        result: list[bytes] = []
+        offset = 0
+        for bits in row_bits:
+            size = (int(bits) + 7) // 8
+            result.append(output[offset : offset + size].tobytes())
+            offset += size
+        return result
 
     def decode_symbols(self, payload: bytes, context: np.ndarray) -> tuple[np.ndarray, np.ndarray, int]:
         context = np.ascontiguousarray(context, dtype=np.int64)

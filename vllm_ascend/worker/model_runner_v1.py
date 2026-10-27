@@ -43,6 +43,7 @@ from vllm.distributed import get_tensor_model_parallel_world_size, tensor_model_
 from vllm.distributed.ec_transfer import get_ec_transfer, has_ec_transfer
 from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_group
 from vllm.distributed.parallel_state import get_dcp_group, get_dp_group, get_pcp_group, get_pp_group, get_tp_group
+from vllm.distributed.utils import get_pp_indices
 from vllm.forward_context import BatchDescriptor, ForwardContext, get_forward_context
 from vllm.logger import logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
@@ -86,6 +87,7 @@ from vllm.v1.outputs import (
     make_empty_encoder_model_runner_output,
 )
 from vllm.v1.sample.logits_processor import build_logitsprocs
+from vllm.v1.sample.logits_processor.builtin import MinTokensLogitsProcessor
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.rejection_sampler import PLACEHOLDER_TOKEN_ID, RejectionSampler
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
@@ -110,6 +112,7 @@ from vllm.v1.worker.utils import AttentionGroup, select_common_block_size
 # between execute_model() calls.
 _TRIO_HETERO_REPLAY = os.environ.get("TRIO_HETERO_REPLAY", "0") == "1"
 _TRIO_PROFILE_TRACE = os.environ.get("TRIO_PROFILE_PATH", "")
+V3_SUPPORTED_VERIFY_ROWS = 8
 
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.attention_v1 import AscendAttentionBackend, AscendAttentionState
@@ -145,9 +148,19 @@ from vllm_ascend.spec_decode.draft_proposer import AscendDraftModelProposer
 from vllm_ascend.spec_decode.eagle_proposer import AscendEagleProposer
 from vllm_ascend.v3.runtime import (
     EventRecorder,
+    NetworkAwarePrefixPolicy,
     SingleOwnerTransactionalState,
     TrajectoryKey,
 )
+from vllm_ascend.v3.state_snapshot import (
+    UnsupportedStateSnapshot,
+    snapshot_attention_committed_state,
+    snapshot_attention_state,
+    snapshot_gdn_committed_state,
+    tensors_bitwise_equal,
+)
+from vllm_ascend.v3.transport import PendingBoundary
+from vllm_ascend.v3.verification import greedy_matching_drafts
 from vllm_ascend.spec_decode.extract_hidden_states_proposer import (
     AscendExtractHiddenStatesProposer,
 )
@@ -616,6 +629,9 @@ class NPUModelRunner(GPUModelRunner):
         self._v3_sots: SingleOwnerTransactionalState | None = None
         self._v3_trajectory: TrajectoryKey | None = None
         self._v3_recorder: EventRecorder | None = None
+        self._v3_pending_boundary: PendingBoundary | None = None
+        self._v3_network_policy: NetworkAwarePrefixPolicy | None = None
+        self._v3_row_bytes: list[int] | None = None
 
         # Profile-only model-body timing.  Each PP rank owns a separate file;
         # profile_real.py pairs records by sequence/composition and takes the
@@ -785,14 +801,90 @@ class NPUModelRunner(GPUModelRunner):
         self._v3_recorder = recorder
         self._v3_sots = SingleOwnerTransactionalState(recorder)
 
-    def v3_boundary_ready(self, codec_id: str = "nvfp4-v1") -> None:
+    def v3_set_pending_boundary(self, boundary: PendingBoundary) -> None:
+        if self._v3_pending_boundary is not None:
+            raise RuntimeError("a V3 boundary is already pending")
+        self._v3_pending_boundary = boundary
+
+    def _v3_sampling_supported(self, scheduler_output: SchedulerOutput) -> bool:
+        sampling = self.input_batch.sampling_metadata
+        if not sampling.all_greedy or not sampling.no_penalties:
+            return False
+        if sampling.allowed_token_ids_mask is not None or sampling.bad_words_token_ids:
+            return False
+        if any(
+            not isinstance(processor, MinTokensLogitsProcessor) or bool(processor.min_toks)
+            for processor in sampling.logitsprocs.non_argmax_invariant
+        ):
+            return False
+        holder = sampling.thinking_budget_state_holder
+        if holder is not None and holder.has_tracked_requests():
+            return False
+        if getattr(scheduler_output, "has_structured_output_requests", False):
+            return False
+        for req_id in self.input_batch.req_ids[: self.input_batch.num_reqs]:
+            request = self.requests.get(req_id)
+            params = getattr(request, "sampling_params", None)
+            if params is None or getattr(params, "structured_outputs", None) is not None:
+                return False
+        return True
+
+    @staticmethod
+    def _v3_copy_boundary(intermediate_tensors: IntermediateTensors, boundary: PendingBoundary) -> None:
+        for key, value in boundary.tensors.items():
+            if isinstance(value, torch.Tensor):
+                target = intermediate_tensors.tensors.get(key)
+                if target is None or target.shape != value.shape:
+                    raise RuntimeError(f"V3 boundary tensor shape changed for {key}")
+                target.copy_(value)
+
+    def _v3_choose_prefix(self, boundary: PendingBoundary, predicted_end: int) -> int:
+        raw = (self.vllm_config.additional_config or {}).get("v3_verdict_adaptive", {})
+        if raw.get("prefix_policy", "fixed") != "network":
+            return max(1, min(int(raw.get("prefix_length", boundary.total_rows)), boundary.total_rows))
+        if self._v3_network_policy is None:
+            self._v3_network_policy = NetworkAwarePrefixPolicy(
+                bandwidth_mbps=float(raw.get("bandwidth_mbps", 10)),
+                rtt_ms=float(raw.get("rtt_ms", 0)),
+                retry_ms=float(raw.get("retry_ms", 40)),
+                k=boundary.total_rows,
+                candidate_prefixes=(4, 6, boundary.total_rows),
+                min_history=int(raw.get("policy_min_history", 8)),
+            )
+        if self._v3_row_bytes is None:
+            return boundary.total_rows
+        return self._v3_network_policy.choose(self._v3_row_bytes, predicted_end=predicted_end).prefix_length
+
+    def _v3_record_prefix(self, boundary: PendingBoundary, predicted_end: int, consumed_end: int) -> None:
+        if self._v3_network_policy is not None:
+            self._v3_network_policy.observe(consumed_end, predicted_end=predicted_end)
+        if self._v3_row_bytes is None:
+            if all(size is not None for size in boundary.row_bytes):
+                self._v3_row_bytes = [int(size) for size in boundary.row_bytes if size is not None]
+        else:
+            for index, size in enumerate(boundary.row_bytes):
+                if size is not None:
+                    self._v3_row_bytes[index] = size
+
+    def v3_boundary_ready(
+        self, scheduler_output: SchedulerOutput | None = None, codec_id: str = "nvfp4-v1"
+    ) -> None:
         if self._v3_sots is None:
             return
-        composition = ",".join(self.input_batch.req_ids[: self.input_batch.num_reqs])
+        composition = (
+            ",".join(scheduler_output.num_scheduled_tokens)
+            if scheduler_output is not None else ",".join(self.input_batch.req_ids[: self.input_batch.num_reqs])
+        )
+        pp_group = get_pp_group()
+        cut_point = get_pp_indices(
+            self.model_config.hf_text_config.num_hidden_layers,
+            min(1, pp_group.world_size - 1),
+            pp_group.world_size,
+        )[0]
         fused = "separate"
         self._v3_trajectory = TrajectoryKey(
             model_version=self.model_config.model,
-            cut_point=int(get_pp_group().rank_in_group),
+            cut_point=cut_point,
             dtype=str(self.dtype).removeprefix("torch."),
             k=1 + int(self.num_spec_tokens or 0),
             batch_composition=composition,
@@ -2395,6 +2487,58 @@ class NPUModelRunner(GPUModelRunner):
         has_encoder_input = self.model_config.is_encoder_decoder and num_encoder_reqs > 0
 
         # Run forward pass
+        pending_v3 = self._v3_pending_boundary
+        self._v3_pending_boundary = None
+        v3_snapshot = None
+        if pending_v3 is not None:
+            assert intermediate_tensors is not None
+            model_type = getattr(self.model_config.hf_text_config, "model_type", "")
+            sampling_supported = self._v3_sampling_supported(scheduler_output)
+            supported = (
+                model_type.startswith("qwen3_5")
+                and pending_v3.total_rows == V3_SUPPORTED_VERIFY_ROWS
+                and self.input_batch.num_reqs == 1
+                and self.parallel_config.tensor_parallel_size == 1
+                and self.pcp_size == 1
+                and self.dcp_size == 1
+                and not self.use_aux_hidden_state_outputs
+                and not has_kv_transfer_group()
+                and spec_decode_metadata is not None
+                and sampling_supported
+            )
+            if not supported:
+                logger.info(
+                    "V3_PREFIX_FALLBACK model=%s rows=%d requests=%d sampling=%s speculative=%s",
+                    model_type, pending_v3.total_rows, self.input_batch.num_reqs,
+                    sampling_supported, spec_decode_metadata is not None,
+                )
+            if supported:
+                try:
+                    if not isinstance(attn_metadata, dict):
+                        raise UnsupportedStateSnapshot("attention metadata is not layer-indexed")
+                    context = self.compilation_config.static_forward_context
+                    required = {
+                        name for group in self.kv_cache_config.kv_cache_groups for name in group.layer_names
+                        if not getattr(group, "is_eagle_group", False)
+                        and name in context and hasattr(context[name], "kv_cache")
+                    }
+                    if not required or not required.issubset(attn_metadata):
+                        raise UnsupportedStateSnapshot("cache layer metadata is incomplete")
+                    for metadata in attn_metadata.values():
+                        if hasattr(metadata, "spec_state_indices_tensor") and (
+                            getattr(metadata, "num_prefills", 0) or getattr(metadata, "num_decodes", 0)
+                        ):
+                            raise UnsupportedStateSnapshot("mixed prefill or non-spec decode")
+                    v3_snapshot = snapshot_attention_state(context, attn_metadata)
+                except (UnsupportedStateSnapshot, RuntimeError) as exc:
+                    logger.warning("V3 prefix VV falls back to full residual: %s", exc)
+            if v3_snapshot is None:
+                pending_v3.request(pending_v3.total_rows)
+                self._v3_copy_boundary(intermediate_tensors, pending_v3)
+                pending_v3.finish(pending_v3.total_rows)
+                self.v3_boundary_ready(scheduler_output)
+                pending_v3 = None
+
         defer_kv_connector_finalize = self.speculative_config is not None and (
             get_pp_group().is_last_rank or self.broadcast_pp_output
         )
@@ -2441,9 +2585,90 @@ class NPUModelRunner(GPUModelRunner):
                 profile_end_event = torch.npu.Event(enable_timing=True)
                 profile_start_event.record()
 
+            if pending_v3 is not None:
+                assert v3_snapshot is not None and spec_decode_metadata is not None
+                draft_count = len(spec_decode_metadata.draft_token_ids)
+                approximate_hidden = self._model_forward(
+                    num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
+                )
+                approximate_logits = self.model.compute_logits(approximate_hidden[logits_indices])
+                predicted_end = greedy_matching_drafts(
+                    approximate_logits, spec_decode_metadata.draft_token_ids, draft_count
+                ) + 1
+                v3_snapshot.restore()
+                v3_raw_config = (self.vllm_config.additional_config or {}).get("v3_verdict_adaptive", {})
+                shadow_full = bool(v3_raw_config.get("prefix_shadow_full", False))
+                if shadow_full and not v3_snapshot.matches():
+                    raise RuntimeError("V3 cache pages differ after DV restore")
+                requested_prefix = self._v3_choose_prefix(pending_v3, predicted_end)
+                pending_v3.request(requested_prefix)
+                self._v3_copy_boundary(intermediate_tensors, pending_v3)
+
             hidden_states = self._model_forward(
                 num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
             )
+            if pending_v3 is not None:
+                assert v3_snapshot is not None and spec_decode_metadata is not None
+                exact_logits = self.model.compute_logits(hidden_states[logits_indices])
+                limit = min(draft_count, requested_prefix)
+                accepted = greedy_matching_drafts(exact_logits, spec_decode_metadata.draft_token_ids, limit)
+                repaired = requested_prefix < pending_v3.total_rows and accepted == requested_prefix
+                if repaired or shadow_full:
+                    if shadow_full:
+                        partial_hidden = hidden_states[:requested_prefix].clone()
+                        partial_logits = exact_logits[:requested_prefix].clone()
+                        partial_gdn = snapshot_gdn_committed_state(
+                            self.compilation_config.static_forward_context,
+                            attn_metadata,
+                            min(accepted + 1, requested_prefix),
+                        )
+                        partial_attention = snapshot_attention_committed_state(
+                            self.compilation_config.static_forward_context,
+                            attn_metadata,
+                            min(accepted + 1, requested_prefix),
+                        )
+                    v3_snapshot.restore()
+                    if shadow_full and not v3_snapshot.matches():
+                        raise RuntimeError("V3 cache pages differ after VV restore")
+                    if requested_prefix < pending_v3.total_rows:
+                        pending_v3.request(pending_v3.total_rows)
+                        self._v3_copy_boundary(intermediate_tensors, pending_v3)
+                    hidden_states = self._model_forward(
+                        num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
+                    )
+                    exact_logits = self.model.compute_logits(hidden_states[logits_indices])
+                    if shadow_full:
+                        full_hidden = hidden_states[:requested_prefix]
+                        full_logits = exact_logits[:requested_prefix]
+                        logger.info(
+                            "V3_PREFIX_SHADOW prefix=%d hidden_equal=%s logits_equal=%s gdn_prefix_equal=%s "
+                            "attention_prefix_equal=%s hidden_max=%g logits_max=%g gdn_diffs=%s attention_diffs=%s",
+                            requested_prefix,
+                            tensors_bitwise_equal(partial_hidden, full_hidden),
+                            tensors_bitwise_equal(partial_logits, full_logits),
+                            partial_gdn.matches(),
+                            partial_attention.matches(),
+                            (partial_hidden.float() - full_hidden.float()).abs().max().item(),
+                            (partial_logits.float() - full_logits.float()).abs().max().item(),
+                            partial_gdn.differences(limit=2),
+                            partial_attention.differences(limit=2),
+                        )
+                    accepted = greedy_matching_drafts(exact_logits, spec_decode_metadata.draft_token_ids, draft_count)
+                consumed_end = accepted + 1
+                pending_v3.finish(consumed_end)
+                self._v3_record_prefix(pending_v3, predicted_end, consumed_end)
+                self.v3_boundary_ready(scheduler_output)
+                if v3_raw_config.get("trace_prefix_row_bytes", False) and all(
+                    size is not None for size in pending_v3.row_bytes
+                ):
+                    anchor_bytes = sum(
+                        getattr(entry, "anchor_bytes", 0) for entry in pending_v3.metadata["entries"].values()
+                    )
+                    logger.info("V3_PREFIX_BYTES anchor=%d rows=%s", anchor_bytes, pending_v3.row_bytes)
+                logger.info(
+                    "V3_PREFIX_VV predicted=%d prefix=%d consumed=%d repaired=%s regions=%d",
+                    predicted_end, requested_prefix, consumed_end, repaired, v3_snapshot.region_count,
+                )
             # TrioSLO half-card emulation: duplicate the model body only.
             # KV slots are rewritten with identical values, while scheduler
             # state, async-sampling state, and PP handshakes remain single-shot.

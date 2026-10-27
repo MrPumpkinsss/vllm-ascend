@@ -4,13 +4,18 @@ import os
 import socket
 import tempfile
 import threading
+import time
 from pathlib import Path
 
+import numpy as np
+import pytest
 import torch
 
+from vllm_ascend.v3.fast_huffman import NativeHuffmanCodec
 from vllm_ascend.v3.nvfp4_codec import NVFP4CodecConfig, NVFP4ExactCodec
 from vllm_ascend.v3.protocol import recv_frame, send_frame
-from vllm_ascend.v3.transport import V3TransportConfig, VerdictAdaptiveTransport
+from vllm_ascend.v3.runtime import NetworkAwarePrefixPolicy
+from vllm_ascend.v3.transport import BoundaryDecision, V3TransportConfig, VerdictAdaptiveTransport
 
 
 def _codec(directory: Path) -> NVFP4ExactCodec:
@@ -39,6 +44,19 @@ def test_nvfp4_rows_are_exact_and_independent(tmp_path):
     assert torch.equal(exact_prefix[:4], tensor[:4])
 
 
+def test_nvfp4_roundtrip_preserves_special_bf16_codes(tmp_path):
+    codec = _codec(tmp_path)
+    patterns = np.array(
+        [0x0000, 0x8000, 0x7F80, 0xFF80, 0x7FC1, 0xFFC2, 0x7F7F, 0xFF7F], dtype=np.uint16
+    )
+    codes = np.tile(patterns, 32).reshape(8, 32)
+    tensor = torch.from_numpy(codes.copy()).view(torch.bfloat16)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        anchor, residuals, _, _ = codec.encode_rows(tensor)
+        decoded, _ = codec.decode_rows(tensor.shape, tensor.device, anchor, residuals)
+    assert torch.equal(decoded.contiguous().view(torch.uint16), tensor.contiguous().view(torch.uint16))
+
+
 def test_frame_roundtrip():
     left, right = socket.socketpair()
     try:
@@ -50,6 +68,29 @@ def test_frame_roundtrip():
     finally:
         left.close()
         right.close()
+
+
+def test_native_huffman_context_offsets_escape_and_truncation():
+    tables = [
+        ["0", "10", "11" + "0" * 15],
+        ["0", "1" * 16 + "0", "1" * 17],
+    ]
+    codec = NativeHuffmanCodec(tables, 17)
+    if not codec.available:
+        pytest.skip("native compiler unavailable")
+    contexts = np.array([0, 1, 1], dtype=np.int64)
+    symbols = np.array([2, 1, 2], dtype=np.uint16)
+    exact = np.array([0x1234, 0, 0xABCD], dtype=np.uint16)
+    bits = tables[0][2] + format(0x1234, "016b") + tables[1][1] + tables[1][2] + format(0xABCD, "016b")
+    bits += "0" * (-len(bits) % 8)
+    expected = int(bits, 2).to_bytes(len(bits) // 8, "big")
+    payload = codec.encode(contexts, symbols, exact).tobytes()
+    assert payload == expected
+    decoded, escapes, _ = codec.decode_symbols(payload, contexts)
+    assert np.array_equal(decoded, symbols)
+    assert escapes[0] == 0x1234 and escapes[2] == 0xABCD
+    with pytest.raises(RuntimeError):
+        codec.decode_symbols(b"\xff\xff", np.array([1], dtype=np.int64))
 
 
 def test_transport_full_and_prefix_repair(tmp_path):
@@ -108,6 +149,241 @@ def test_transport_full_and_prefix_repair(tmp_path):
     assert receiver.stats()["suffix_requests"] == 1
 
 
+def test_prefix_repair_sends_only_missing_rows(tmp_path):
+    codec = _codec(tmp_path)
+    tensor = torch.randn((8, 2, 32), generator=torch.Generator().manual_seed(91)).to(torch.bfloat16)
+    _, payloads, _, _ = codec.encode_rows(tensor)
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+    kwargs = dict(
+        listen_host="127.0.0.1", listen_port=port, connect_host="127.0.0.1", connect_port=port,
+        calibration_path=str(tmp_path / "tables.npz"), adaptive=True, default_prefix_length=4,
+    )
+    sender = VerdictAdaptiveTransport(sender=True, **kwargs)
+    receiver = VerdictAdaptiveTransport(sender=False, **kwargs)
+    seen: list[int] = []
+    received: list[torch.Tensor] = []
+
+    def receive():
+        def verdict(result, length):
+            assert torch.equal(result["hidden_states"][:length], tensor[:length])
+            seen.append(length)
+            return {4: 6, 6: 8, 8: 8}[length]
+
+        received.append(receiver.recv_tensor_dict(verdict_callback=verdict)["hidden_states"])
+
+    thread = threading.Thread(target=receive)
+    thread.start()
+    sender.send_tensor_dict({"hidden_states": tensor})
+    thread.join(timeout=20)
+    assert not thread.is_alive()
+    assert seen == [4, 6, 8]
+    assert torch.equal(received[0], tensor)
+    assert sender.residual_wire_bytes == sum(map(len, payloads))
+    assert receiver.residual_wire_bytes == sender.residual_wire_bytes
+
+
+def test_adaptive_without_verdict_defaults_to_full_exact(tmp_path):
+    _codec(tmp_path)
+    tensor = torch.randn((8, 32), generator=torch.Generator().manual_seed(99)).to(torch.bfloat16)
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+    kwargs = dict(
+        listen_host="127.0.0.1", listen_port=port, connect_host="127.0.0.1", connect_port=port,
+        calibration_path=str(tmp_path / "tables.npz"), adaptive=True, default_prefix_length=4,
+    )
+    sender = VerdictAdaptiveTransport(sender=True, **kwargs)
+    receiver = VerdictAdaptiveTransport(sender=False, **kwargs)
+    received: list[torch.Tensor] = []
+    thread = threading.Thread(target=lambda: received.append(receiver.recv_tensor_dict()["hidden_states"]))
+    thread.start()
+    sender.send_tensor_dict({"hidden_states": tensor})
+    thread.join(timeout=20)
+    assert not thread.is_alive()
+    assert torch.equal(received[0], tensor)
+
+
+def test_network_policy_drives_verified_transport_without_future_verdicts(tmp_path):
+    _codec(tmp_path)
+    tensors = [torch.randn((8, 32), generator=torch.Generator().manual_seed(seed)).to(torch.bfloat16)
+               for seed in (201, 202, 203, 204)]
+    needed_rows = [2, 2, 8, 2]
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+    kwargs = dict(
+        listen_host="127.0.0.1", listen_port=port, connect_host="127.0.0.1", connect_port=port,
+        calibration_path=str(tmp_path / "tables.npz"), adaptive=True, default_prefix_length=4,
+    )
+    sender = VerdictAdaptiveTransport(sender=True, **kwargs)
+    receiver = VerdictAdaptiveTransport(sender=False, **kwargs)
+    policy = NetworkAwarePrefixPolicy(bandwidth_mbps=10, rtt_ms=0, retry_ms=0, min_history=2)
+    selected: list[int] = []
+    errors: list[Exception] = []
+
+    def receive():
+        try:
+            for tensor, needed in zip(tensors, needed_rows):
+                def verdict(result, prefix, expected=tensor, required=needed):
+                    assert torch.equal(result["hidden_states"][:prefix], expected[:prefix])
+                    return required
+
+                result = receiver.recv_tensor_dict(
+                    approximate_callback=lambda _: BoundaryDecision(4, {"predicted_end": 2}),
+                    verdict_callback=verdict,
+                    policy=policy,
+                )
+                assert torch.equal(result["hidden_states"][:needed], tensor[:needed])
+                selected.append(receiver.policy_last_prefix)
+        except Exception as exc:
+            errors.append(exc)
+
+    thread = threading.Thread(target=receive)
+    thread.start()
+    for tensor in tensors:
+        sender.send_tensor_dict({"hidden_states": tensor})
+    thread.join(timeout=20)
+    assert not thread.is_alive()
+    assert not errors
+    assert selected == [8, 8, 4, 4]
+    assert sender.suffix_requests == 1
+    assert list(policy.history) == needed_rows
+
+
+def test_pending_boundary_requires_repair_before_finish(tmp_path):
+    _codec(tmp_path)
+    tensor = torch.randn((8, 32), generator=torch.Generator().manual_seed(301)).to(torch.bfloat16)
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+    kwargs = dict(
+        listen_host="127.0.0.1", listen_port=port, connect_host="127.0.0.1", connect_port=port,
+        calibration_path=str(tmp_path / "tables.npz"), adaptive=True, default_prefix_length=4,
+    )
+    sender = VerdictAdaptiveTransport(sender=True, **kwargs)
+    receiver = VerdictAdaptiveTransport(sender=False, **kwargs)
+    errors: list[Exception] = []
+
+    def receive():
+        try:
+            boundary = receiver.begin_boundary()
+            with pytest.raises(ValueError):
+                boundary.finish(0)
+            partial = boundary.request(4)["hidden_states"]
+            assert torch.equal(partial[:4], tensor[:4])
+            assert torch.count_nonzero(partial[4:]) == 0
+            with pytest.raises(ValueError):
+                boundary.finish(5)
+            full = boundary.request(8)["hidden_states"]
+            assert torch.equal(full, tensor)
+            boundary.finish(8)
+        except Exception as exc:
+            errors.append(exc)
+
+    thread = threading.Thread(target=receive)
+    thread.start()
+    sender.send_tensor_dict({"hidden_states": tensor})
+    thread.join(timeout=20)
+    assert not thread.is_alive()
+    assert not errors
+    assert sender.suffix_requests == receiver.suffix_requests == 1
+
+
+def test_background_frames_remain_ordered(tmp_path, monkeypatch):
+    _codec(tmp_path)
+    tensors = [torch.randn((8, 32), generator=torch.Generator().manual_seed(seed)).to(torch.bfloat16)
+               for seed in (101, 102)]
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+    kwargs = dict(
+        listen_host="127.0.0.1", listen_port=port, connect_host="127.0.0.1", connect_port=port,
+        calibration_path=str(tmp_path / "tables.npz"), adaptive=False,
+    )
+    sender = VerdictAdaptiveTransport(sender=True, **kwargs)
+    receiver = VerdictAdaptiveTransport(sender=False, **kwargs)
+    send_residual = sender._send_full_residual_background
+
+    def delayed_send(entries, semantic):
+        time.sleep(0.05)
+        send_residual(entries, semantic)
+
+    monkeypatch.setattr(sender, "_send_full_residual_background", delayed_send)
+    received: list[torch.Tensor] = []
+
+    def receive():
+        for _ in tensors:
+            received.append(receiver.recv_tensor_dict()["hidden_states"])
+
+    thread = threading.Thread(target=receive)
+    thread.start()
+    for tensor in tensors:
+        sender.send_tensor_dict({"hidden_states": tensor})
+    sender.flush()
+    thread.join(timeout=20)
+    assert not thread.is_alive()
+    assert len(received) == len(tensors)
+    assert all(torch.equal(left, right) for left, right in zip(received, tensors))
+
+
+def test_background_send_error_is_propagated(tmp_path, monkeypatch):
+    _codec(tmp_path)
+    sender = VerdictAdaptiveTransport(
+        "127.0.0.1", 1, "127.0.0.1", 1, sender=True, calibration_path=str(tmp_path / "tables.npz")
+    )
+    left, right = socket.socketpair()
+    sender._socket = left
+
+    def fail(entries, semantic):
+        raise ValueError("test failure")
+
+    monkeypatch.setattr(sender, "_send_full_residual_background", fail)
+    try:
+        sender.send_tensor_dict({"epoch": 1})
+        with pytest.raises(RuntimeError, match="background residual sender failed"):
+            sender.flush()
+        assert recv_frame(right).kind == "ANCHOR"
+        with pytest.raises(ConnectionError):
+            recv_frame(right)
+    finally:
+        left.close()
+        right.close()
+
+
+def test_verdict_callback_error_unblocks_sender(tmp_path):
+    _codec(tmp_path)
+    tensor = torch.randn((8, 32), generator=torch.Generator().manual_seed(103)).to(torch.bfloat16)
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+    kwargs = dict(
+        listen_host="127.0.0.1", listen_port=port, connect_host="127.0.0.1", connect_port=port,
+        calibration_path=str(tmp_path / "tables.npz"), adaptive=True, default_prefix_length=4,
+    )
+    sender = VerdictAdaptiveTransport(sender=True, **kwargs)
+    receiver = VerdictAdaptiveTransport(sender=False, **kwargs)
+    errors: list[Exception] = []
+
+    def receive():
+        def fail(result, prefix):
+            raise ValueError("verdict failed")
+
+        try:
+            receiver.recv_tensor_dict(verdict_callback=fail)
+        except Exception as exc:
+            errors.append(exc)
+
+    thread = threading.Thread(target=receive)
+    thread.start()
+    with pytest.raises((ConnectionError, OSError)):
+        sender.send_tensor_dict({"hidden_states": tensor})
+    thread.join(timeout=20)
+    assert not thread.is_alive()
+    assert len(errors) == 1 and isinstance(errors[0], ValueError)
+
+
 def test_additional_config_is_spawn_safe():
     config = V3TransportConfig.from_vllm_config(
         {
@@ -164,3 +440,31 @@ def test_transport_full_residual_is_exact(tmp_path):
     assert not thread.is_alive()
     assert torch.equal(received[0], tensor)
     assert sender.stats()["suffix_requests"] == 0
+
+
+def test_transport_raw_bf16_mode(tmp_path):
+    _codec(tmp_path)
+    generator = torch.Generator().manual_seed(53)
+    tensor = torch.randn((8, 32), generator=generator, dtype=torch.float32).to(torch.bfloat16)
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+    receiver = VerdictAdaptiveTransport(
+        "127.0.0.1", port, "127.0.0.1", port, sender=False,
+        calibration_path=str(tmp_path / "tables.npz"), codec_mode="raw",
+    )
+    sender = VerdictAdaptiveTransport(
+        "127.0.0.1", port, "127.0.0.1", port, sender=True,
+        calibration_path=str(tmp_path / "tables.npz"), codec_mode="raw",
+    )
+    received: list[torch.Tensor] = []
+
+    def receiver_main():
+        received.append(receiver.recv_tensor_dict()["hidden_states"])
+
+    thread = threading.Thread(target=receiver_main)
+    thread.start()
+    sender.send_tensor_dict({"hidden_states": tensor})
+    thread.join(timeout=20)
+    assert not thread.is_alive()
+    assert torch.equal(received[0], tensor)

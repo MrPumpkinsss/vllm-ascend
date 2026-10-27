@@ -83,6 +83,7 @@ extern "C" int64_t huff_decode(
         }
         const int64_t length = static_cast<int64_t>(packed >> 20);
         const uint32_t sym = packed & ((1u << 20) - 1);
+        if (length <= 0 || pos + length > total_bits) return -4;
         decoded[i] = static_cast<uint16_t>(sym);
         pos += length;
         if (sym == escape_symbol) {
@@ -90,6 +91,44 @@ extern "C" int64_t huff_decode(
             escapes[i] = static_cast<uint16_t>(peek_bits(data, pos, 16));
             pos += 16;
         }
+    }
+    return pos;
+}
+
+extern "C" int64_t huff_encode_rows(
+    const uint32_t* code_values,
+    const uint8_t* code_lengths,
+    const int64_t* ctx,
+    const uint16_t* symbols,
+    const uint16_t* exact_codes,
+    int64_t row_elements,
+    int64_t num_rows,
+    uint8_t* out,
+    int64_t capacity_bits,
+    uint16_t escape_symbol,
+    int64_t* row_bits
+) {
+    int64_t pos = 0;
+    for (int64_t row = 0; row < num_rows; ++row) {
+        const int64_t begin = row * row_elements;
+        const int64_t end = begin + row_elements;
+        const int64_t row_start = pos;
+        for (int64_t i = begin; i < end; ++i) {
+            const int64_t c = ctx[i];
+            const uint16_t sym = symbols[i];
+            const int len = code_lengths[(c << 10) + sym];
+            if (len <= 0 || len > 32) return -1;
+            if (pos + len > capacity_bits) return -2;
+            put_bits(out, pos, code_values[(c << 10) + sym], len);
+            pos += len;
+            if (sym == escape_symbol) {
+                if (pos + 16 > capacity_bits) return -2;
+                put_bits(out, pos, exact_codes[i], 16);
+                pos += 16;
+            }
+        }
+        row_bits[row] = pos - row_start;
+        pos = (pos + 7) & ~static_cast<int64_t>(7);
     }
     return pos;
 }

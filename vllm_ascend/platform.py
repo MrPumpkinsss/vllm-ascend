@@ -443,11 +443,13 @@ class NPUPlatform(Platform):
         additional = getattr(vllm_config, "additional_config", None) or {}
         v3 = additional.get("v3_verdict_adaptive", {}) if isinstance(additional, dict) else {}
         v3_enabled = bool(v3.get("enabled", False)) if isinstance(v3, dict) else False
+        fix_pp_mtp = bool(v3.get("fix_pp_mtp", v3_enabled)) if isinstance(v3, dict) else False
         if (
             (
                 os.environ.get("VLLM_ASCEND_V2_SEMANTIC_PP", "0") == "1"
                 or os.environ.get("VLLM_ASCEND_V3_VERDICT_ADAPTIVE", "0") == "1"
                 or v3_enabled
+                or fix_pp_mtp
             )
             and parallel_config.pipeline_parallel_size == 2
         ):

@@ -2,12 +2,45 @@ from __future__ import annotations
 
 from vllm_ascend.v3.runtime import (
     EventRecorder,
+    NetworkAwarePrefixPolicy,
     PrefixPolicy,
     ReadyFlowController,
     SingleOwnerTransactionalState,
     TrajectoryKey,
     V3EventKind,
 )
+
+
+def test_network_aware_policy_uses_only_previous_outcomes():
+    policy = NetworkAwarePrefixPolicy(bandwidth_mbps=10, rtt_ms=0, retry_ms=0, min_history=4)
+    sizes = [5000] * 8
+    assert policy.choose(sizes).prefix_length == 8
+    for consumed in (2, 3, 2, 3):
+        policy.observe(consumed, predicted_end=3)
+    decision = policy.choose(sizes, predicted_end=3)
+    assert decision.prefix_length == 4
+    assert decision.history_source == "predicted"
+    assert decision.miss_probability[4] == 1 / 6
+    assert policy.choose(sizes, predicted_end=7).history_source == "global"
+
+
+def test_network_aware_policy_avoids_repair_with_large_rtt():
+    policy = NetworkAwarePrefixPolicy(bandwidth_mbps=100, rtt_ms=20, retry_ms=5, min_history=4)
+    for consumed in (2, 8, 6, 8):
+        policy.observe(consumed)
+    assert policy.choose([5000] * 8).prefix_length == 8
+
+
+def test_network_aware_policy_rejects_invalid_observations():
+    import pytest
+
+    policy = NetworkAwarePrefixPolicy(bandwidth_mbps=10, rtt_ms=1, retry_ms=0)
+    with pytest.raises(ValueError):
+        policy.observe(0)
+    with pytest.raises(ValueError):
+        policy.choose([1] * 7)
+    with pytest.raises(ValueError):
+        NetworkAwarePrefixPolicy(bandwidth_mbps=0, rtt_ms=1, retry_ms=0)
 
 
 def test_prefix_policy_uses_history_and_nack():

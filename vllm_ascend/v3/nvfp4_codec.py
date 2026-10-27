@@ -151,15 +151,25 @@ class NVFP4ExactCodec:
         sign = np.sign(norm)
         index = np.searchsorted(FP4_MIDPOINTS, np.abs(norm), side="right")
         code = ((sign < 0).astype(np.uint8) << 3) | index.astype(np.uint8)
-        bits = np.unpackbits(code[..., None], axis=-1, bitorder="big")[..., -4:]
-        payload = np.packbits(bits.reshape(-1), bitorder="big").tobytes()
+        # Two signed e2m1 codes form one byte.  This direct nibble pack avoids
+        # the 4x temporary produced by unpackbits/packbits.
+        flat_code = code.reshape(-1).astype(np.uint8)
+        packed = (flat_code[0::2] << 4) | flat_code[1::2]
+        payload = packed.tobytes()
         payload += scale8.view(torch.uint8).numpy().tobytes()
         expected = n * (self.config.hidden_size // 2 + blocks)
         if len(payload) != expected:
             raise AssertionError((len(payload), expected))
         return payload, code
 
-    def decode_anchor(self, payload: bytes, shape: torch.Size, device: torch.device) -> tuple[torch.Tensor, np.ndarray]:
+    def decode_anchor(
+        self,
+        payload: bytes,
+        shape: torch.Size,
+        device: torch.device,
+        *,
+        output_device: torch.device | str | None = None,
+    ) -> tuple[torch.Tensor, np.ndarray]:
         blocks = self.config.hidden_size // FP4_BLOCK
         per_token = self.config.hidden_size // 2 + blocks
         if len(payload) % per_token:
@@ -169,21 +179,19 @@ class NVFP4ExactCodec:
         if n != expected_n:
             raise ValueError(f"anchor has {n} tokens, metadata expects {expected_n}")
         qbytes = n * self.config.hidden_size // 2
-        raw = np.unpackbits(np.frombuffer(payload[:qbytes], np.uint8), bitorder="big")
-        bits = raw.reshape(-1, 4)
-        code = (
-            bits[:, 0].astype(np.uint8) * 8
-            + bits[:, 1].astype(np.uint8) * 4
-            + bits[:, 2].astype(np.uint8) * 2
-            + bits[:, 3].astype(np.uint8)
-        ).reshape(n, blocks, FP4_BLOCK)
+        packed = np.frombuffer(payload[:qbytes], np.uint8)
+        code = np.empty(packed.size * 2, dtype=np.uint8)
+        code[0::2] = packed >> 4
+        code[1::2] = packed & np.uint8(0x0F)
+        code = code.reshape(n, blocks, FP4_BLOCK)
         scale_bytes = np.frombuffer(payload[qbytes:], np.uint8).reshape(n, blocks, 1).copy()
         scale = torch.from_numpy(scale_bytes).view(torch.float8_e4m3fn).float().numpy()
         sign = np.where(code >= 8, -1.0, 1.0).astype(np.float32)
         q = sign * FP4_POSITIVE[(code & 7).astype(np.int8)]
         prediction = (q.astype(np.float32) * scale).reshape(n, self.config.hidden_size)
         tensor = torch.from_numpy(prediction.copy()).to(torch.bfloat16).reshape(shape)
-        return tensor.to(device=device), code
+        target = device if output_device is None else torch.device(output_device)
+        return tensor.to(device=target), code
 
     def _symbols(self, prediction: torch.Tensor, exact: torch.Tensor):
         x = self._codes(exact).reshape(-1)
@@ -253,8 +261,12 @@ class NVFP4ExactCodec:
     ) -> tuple[bytes, float]:
         if self.tables is None:
             raise RuntimeError("NVFP4 residual coder is not calibrated")
+        if prediction.shape != exact.shape:
+            raise ValueError("prediction and exact tensors must have the same shape")
         symbols, exact_codes, _, representable = self._symbols(prediction, exact)
         context = anchor_code.reshape(-1).astype(np.int64)
+        if len(context) != len(symbols):
+            raise ValueError("anchor code count does not match residual tensor")
         if self.native_huffman is not None and self.native_huffman.available:
             payload = self.native_huffman.encode(context, symbols, exact_codes)
             return payload, float(1.0 - representable.mean())
@@ -265,6 +277,80 @@ class NVFP4ExactCodec:
                 writer.write(format(int(code), "016b"))
         return writer.bytes(), float(1.0 - representable.mean())
 
+    def encode_residual_rows(
+        self, prediction: torch.Tensor, exact: torch.Tensor, anchor_code: np.ndarray
+    ) -> tuple[list[bytes], float]:
+        if self.tables is None:
+            raise RuntimeError("NVFP4 residual coder is not calibrated")
+        if prediction.shape != exact.shape or prediction.shape[0] == 0:
+            raise ValueError("prediction and exact row tensors must have the same non-empty shape")
+        symbols, exact_codes, _, representable = self._symbols(prediction, exact)
+        context = anchor_code.reshape(-1).astype(np.int64)
+        if len(context) != len(symbols):
+            raise ValueError("anchor code count does not match residual tensor")
+        if self.native_huffman is not None and self.native_huffman.available:
+            row_elements = int(np.prod(prediction.shape[1:], dtype=np.int64))
+            payloads = self.native_huffman.encode_rows(context, symbols, exact_codes, row_elements)
+            return payloads, float(1.0 - representable.mean())
+        payloads: list[bytes] = []
+        row_tokens = int(np.prod(prediction.shape[1:-1], dtype=np.int64))
+        for row in range(prediction.shape[0]):
+            payload, escape_rate = self.encode_residual(
+                prediction[row : row + 1], exact[row : row + 1],
+                anchor_code[row * row_tokens : (row + 1) * row_tokens],
+            )
+            payloads.append(payload)
+        return payloads, float(1.0 - representable.mean())
+
+    def decode_residual_rows(
+        self, prediction: torch.Tensor, anchor_code: np.ndarray, payloads: list[bytes]
+    ) -> torch.Tensor:
+        if self.decoders is None:
+            raise RuntimeError("NVFP4 residual coder is not calibrated")
+        if len(payloads) > prediction.shape[0]:
+            raise ValueError("more residual payloads than tensor rows")
+        predicted_codes = self._codes(prediction).reshape(-1)
+        context = anchor_code.reshape(-1).astype(np.int64)
+        if len(context) != len(predicted_codes):
+            raise ValueError("anchor code count does not match residual tensor")
+        row_elements = int(np.prod(prediction.shape[1:], dtype=np.int64))
+        decoded = np.empty(len(payloads) * row_elements, dtype=np.uint16)
+        escapes = np.empty(len(payloads) * row_elements, dtype=np.uint16)
+        if self.native_huffman is not None and self.native_huffman.available:
+            for row, payload in enumerate(payloads):
+                begin, end = row * row_elements, (row + 1) * row_elements
+                decoded[begin:end], escapes[begin:end], _ = self.native_huffman.decode_symbols(
+                    payload, context[begin:end]
+                )
+        else:
+            for row, payload in enumerate(payloads):
+                begin, end = row * row_elements, (row + 1) * row_elements
+                reader = _BitReader(payload)
+                for index in range(begin, end):
+                    prefix, symbol, decoder = "", None, self.decoders[int(context[index])]
+                    while symbol is None:
+                        prefix += reader.bit()
+                        symbol = decoder.get(prefix)
+                        if len(prefix) > self.max_code_length:
+                            raise ValueError("invalid NVFP4 residual Huffman prefix")
+                    decoded[index] = symbol
+                    if symbol == ESCAPE_SYMBOL:
+                        escapes[index] = reader.raw16()
+        rank = RANK_TABLE[predicted_codes[: len(decoded)]].astype(np.int32)
+        rank += decoded.astype(np.int32) - MAX_RANK_DELTA
+        escaped = decoded == ESCAPE_SYMBOL
+        bounded = (~escaped) & (rank >= 0) & (rank < len(FINITE_CODES))
+        if not bool(np.all(escaped | bounded)):
+            raise ValueError("decoded BF16 rank is out of range")
+        output = np.empty(len(prediction.reshape(-1)), dtype=np.uint16)
+        output[: len(decoded)][escaped] = escapes[escaped]
+        output[: len(decoded)][~escaped] = FINITE_CODES[rank[~escaped]]
+        # Untouched suffix rows retain their deterministic anchor prediction.
+        output[len(decoded) :] = predicted_codes[len(decoded) :]
+        return torch.from_numpy(output.copy()).view(torch.bfloat16).reshape(prediction.shape).to(
+            device=prediction.device, dtype=torch.bfloat16
+        )
+
     def decode_residual(
         self, prediction: torch.Tensor, anchor_code: np.ndarray, payload: bytes, shape: torch.Size, device: torch.device
     ) -> torch.Tensor:
@@ -272,6 +358,8 @@ class NVFP4ExactCodec:
             raise RuntimeError("NVFP4 residual coder is not calibrated")
         predicted_codes = self._codes(prediction).reshape(-1)
         context = anchor_code.reshape(-1).astype(np.int64)
+        if len(context) != len(predicted_codes):
+            raise ValueError("anchor code count does not match residual tensor")
         if self.native_huffman is not None and self.native_huffman.available:
             decoded, escape_codes, _ = self.native_huffman.decode_symbols(payload, context)
             rank = RANK_TABLE[predicted_codes].astype(np.int32) + decoded.astype(np.int32) - MAX_RANK_DELTA
@@ -302,6 +390,29 @@ class NVFP4ExactCodec:
         tensor = torch.from_numpy(output.copy()).view(torch.bfloat16).reshape(shape)
         return tensor.to(device=device, dtype=torch.bfloat16)
 
+    @staticmethod
+    def encode_raw_rows(tensor: torch.Tensor) -> list[bytes]:
+        raw = tensor.detach().cpu().contiguous().view(torch.uint16).numpy()
+        return [row.tobytes() for row in raw.reshape(raw.shape[0], -1)]
+
+    @staticmethod
+    def decode_raw_rows(
+        prediction: torch.Tensor, payloads: list[bytes]
+    ) -> torch.Tensor:
+        if not payloads:
+            return prediction
+        rows = len(payloads)
+        raw = np.frombuffer(b"".join(payloads), dtype=np.uint16).copy()
+        expected = int(np.prod(prediction.shape[1:], dtype=np.int64))
+        if raw.size != rows * expected:
+            raise ValueError("bad raw BF16 residual size")
+        exact = torch.from_numpy(raw).view(torch.bfloat16).reshape(
+            rows, *prediction.shape[1:]
+        )
+        result = prediction.clone()
+        result[:rows] = exact.to(device=prediction.device, dtype=prediction.dtype)
+        return result
+
     def encode(self, tensor: torch.Tensor) -> tuple[bytes, bytes, torch.Tensor, float]:
         anchor, code = self.encode_anchor(tensor)
         prediction, decoded_code = self.decode_anchor(anchor, tensor.shape, tensor.device)
@@ -322,9 +433,11 @@ class NVFP4ExactCodec:
         selected = list(range(n)) if rows is None else list(rows)
         residuals: list[bytes] = []
         escapes: list[float] = []
+        row_tokens = int(np.prod(tensor.shape[1:-1], dtype=np.int64))
         for row in selected:
             residual, escape = self.encode_residual(
-                prediction[row : row + 1], tensor[row : row + 1], decoded_code[row : row + 1]
+                prediction[row : row + 1], tensor[row : row + 1],
+                decoded_code[row * row_tokens : (row + 1) * row_tokens],
             )
             residuals.append(residual)
             escapes.append(escape)
@@ -344,9 +457,11 @@ class NVFP4ExactCodec:
             raise ValueError("more residual rows than tensor rows")
         prediction, code = self.decode_anchor(anchor, shape, device)
         result = prediction.clone()
+        row_tokens = int(np.prod(shape[1:-1], dtype=np.int64))
         for row, payload in enumerate(residuals):
             result[row : row + 1] = self.decode_residual(
-                prediction[row : row + 1], code[row : row + 1], payload, result[row : row + 1].shape, device
+                prediction[row : row + 1], code[row * row_tokens : (row + 1) * row_tokens],
+                payload, result[row : row + 1].shape, device,
             )
         if dummy_suffix is not None and len(residuals) < shape[0]:
             result[len(residuals) :] = dummy_suffix.to(device=device, dtype=result.dtype)

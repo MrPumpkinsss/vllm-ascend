@@ -12,6 +12,7 @@ through the commit API.
 
 
 import json
+import math
 import time
 from collections import deque
 from dataclasses import asdict, dataclass, field
@@ -143,6 +144,86 @@ class PrefixPolicy:
             "suffix_request_rate": self.suffix_requests / self.requests if self.requests else 0.0,
             "recent_consumed": list(self.recent_consumed),
         }
+
+
+@dataclass(frozen=True)
+class PrefixCostDecision:
+    prefix_length: int
+    expected_cost_ms: dict[int, float]
+    miss_probability: dict[int, float]
+    history_size: int
+    history_source: str
+
+
+@dataclass
+class NetworkAwarePrefixPolicy:
+    """Choose exact-prefix bytes from past VV outcomes, never from future verdicts."""
+
+    bandwidth_mbps: float
+    rtt_ms: float
+    retry_ms: float
+    k: int = 8
+    candidate_prefixes: tuple[int, ...] = (4, 6, 8)
+    min_history: int = 8
+    history_size: int = 128
+    prior_misses: float = 1.0
+    prior_hits: float = 1.0
+    history: deque[int] = field(default_factory=deque, init=False)
+    predicted_history: dict[int, deque[int]] = field(default_factory=dict, init=False)
+
+    def __post_init__(self) -> None:
+        values = (self.bandwidth_mbps, self.rtt_ms, self.retry_ms, self.prior_misses, self.prior_hits)
+        if not all(math.isfinite(value) for value in values):
+            raise ValueError("network policy parameters must be finite")
+        if self.bandwidth_mbps <= 0 or min(self.rtt_ms, self.retry_ms, self.prior_misses, self.prior_hits) < 0:
+            raise ValueError("invalid network policy parameters")
+        if self.k <= 0 or self.min_history <= 0 or self.history_size < self.min_history:
+            raise ValueError("invalid policy history or K")
+        prefixes = tuple(sorted(set(self.candidate_prefixes)))
+        if not prefixes or prefixes[-1] != self.k or prefixes[0] < 1:
+            raise ValueError("candidate prefixes must be in 1..K and include K")
+        self.candidate_prefixes = prefixes
+        self.history = deque(maxlen=self.history_size)
+
+    def observe(self, consumed_end: int, predicted_end: int | None = None) -> None:
+        if not 1 <= consumed_end <= self.k:
+            raise ValueError("consumed end must be in 1..K")
+        if predicted_end is not None and not 1 <= predicted_end <= self.k:
+            raise ValueError("predicted end must be in 1..K")
+        self.history.append(consumed_end)
+        if predicted_end is not None:
+            history = self.predicted_history.setdefault(predicted_end, deque(maxlen=self.history_size))
+            history.append(consumed_end)
+
+    def choose(self, row_bytes: list[int] | tuple[int, ...], predicted_end: int | None = None) -> PrefixCostDecision:
+        if len(row_bytes) != self.k or any(size < 0 for size in row_bytes):
+            raise ValueError("row byte estimates must contain K nonnegative values")
+        if predicted_end is not None and not 1 <= predicted_end <= self.k:
+            raise ValueError("predicted end must be in 1..K")
+        history = self.predicted_history.get(predicted_end) if predicted_end is not None else None
+        if history is not None and len(history) >= self.min_history:
+            source = "predicted"
+        else:
+            history = self.history
+            source = "global"
+        if len(history) < self.min_history:
+            return PrefixCostDecision(self.k, {}, {}, len(history), "cold")
+
+        cost_ms: dict[int, float] = {}
+        miss_probability: dict[int, float] = {}
+        byte_ms = 8.0 / (self.bandwidth_mbps * 1000.0)
+        for prefix in self.candidate_prefixes:
+            if prefix == self.k:
+                miss = 0.0
+            else:
+                misses = sum(consumed > prefix for consumed in history)
+                miss = (misses + self.prior_misses) / (len(history) + self.prior_misses + self.prior_hits)
+            initial_ms = sum(row_bytes[:prefix]) * byte_ms
+            suffix_ms = sum(row_bytes[prefix:]) * byte_ms
+            cost_ms[prefix] = initial_ms + miss * (suffix_ms + self.rtt_ms + self.retry_ms)
+            miss_probability[prefix] = miss
+        best = min(self.candidate_prefixes, key=lambda prefix: (cost_ms[prefix], -prefix))
+        return PrefixCostDecision(best, cost_ms, miss_probability, len(history), source)
 
 
 @dataclass

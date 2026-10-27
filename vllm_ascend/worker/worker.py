@@ -645,12 +645,36 @@ class NPUWorker(WorkerBase):
             self._pp_send_work = []
 
         intermediate_tensors = None
+        pending_v3_boundary = None
         forward_pass = scheduler_output.total_num_scheduled_tokens > 0
         if forward_pass and not get_pp_group().is_first_rank:
             if self.v3_transport is not None:
-                tensor_dict = self.v3_transport.recv_tensor_dict()
-                if hasattr(self.model_runner, "v3_boundary_ready"):
-                    self.model_runner.v3_boundary_ready()
+                if self.v3_transport.adaptive:
+                    pending_v3_boundary = self.v3_transport.begin_boundary()
+                    verify_rows = 1 + int(getattr(self.model_runner, "num_spec_tokens", 0) or 0)
+                    eligible = (
+                        verify_rows > 1
+                        and pending_v3_boundary.total_rows == verify_rows
+                        and scheduler_output.total_num_scheduled_tokens == verify_rows
+                        and len(scheduler_output.scheduled_spec_decode_tokens) == 1
+                        and hasattr(self.model_runner, "v3_set_pending_boundary")
+                    )
+                    logger.info(
+                        "V3_PREFIX_RECEIVE rows=%d scheduled=%d spec_reqs=%d eligible=%s",
+                        pending_v3_boundary.total_rows, scheduler_output.total_num_scheduled_tokens,
+                        len(scheduler_output.scheduled_spec_decode_tokens), eligible,
+                    )
+                    if eligible:
+                        tensor_dict = pending_v3_boundary.approximate
+                        self.model_runner.v3_set_pending_boundary(pending_v3_boundary)
+                    else:
+                        tensor_dict = pending_v3_boundary.request(pending_v3_boundary.total_rows)
+                        pending_v3_boundary.finish(pending_v3_boundary.total_rows)
+                        pending_v3_boundary = None
+                else:
+                    tensor_dict = self.v3_transport.recv_tensor_dict()
+                if pending_v3_boundary is None and hasattr(self.model_runner, "v3_boundary_ready"):
+                    self.model_runner.v3_boundary_ready(scheduler_output)
                 comm_handles, comm_postprocess = [], []
             elif self.v2_semantic_pp is not None:
                 tensor_dict = self.v2_semantic_pp.recv_tensor_dict()
@@ -675,7 +699,15 @@ class NPUWorker(WorkerBase):
         if self.profiler is not None:
             self.profiler.step()
 
-        output = self.model_runner.execute_model(scheduler_output, intermediate_tensors)
+        try:
+            output = self.model_runner.execute_model(scheduler_output, intermediate_tensors)
+        except BaseException:
+            if pending_v3_boundary is not None and not pending_v3_boundary.closed:
+                pending_v3_boundary.abort()
+            raise
+        if pending_v3_boundary is not None and not pending_v3_boundary.closed:
+            pending_v3_boundary.abort()
+            raise RuntimeError("V3 model execution returned without resolving its boundary")
         if isinstance(output, (ModelRunnerOutput, AsyncModelRunnerOutput, NoneType)):
             return output
 
@@ -1047,10 +1079,13 @@ class NPUWorker(WorkerBase):
 
         if self.vllm_config.parallel_config.pipeline_parallel_size == 2:
             v3_config = V3TransportConfig.from_vllm_config(self.vllm_config.additional_config)
-            # Stock vLLM has no VV verdict callback at this layer yet.  Always
-            # request the full independent residual so committed outputs remain
-            # exact; Prefix-Repair stays a transport-level tested protocol.
-            v3_config.adaptive = False
+            if not v3_config.engine_prefix_vv:
+                v3_config.adaptive = False
+            if v3_config.enabled and v3_config.adaptive and v3_config.engine_prefix_vv and get_pp_group().is_last_rank:
+                logger.warning(
+                    "V3 prefix verification is experimental: output equivalence is not established; "
+                    "do not use this path for production."
+                )
             self.v3_transport = VerdictAdaptiveTransport.from_config(
                 v3_config, sender=get_pp_group().is_first_rank
             )
