@@ -146,6 +146,7 @@ from vllm_ascend.spec_decode import get_spec_decode_method
 from vllm_ascend.spec_decode.dflash_proposer import AscendDflashProposer
 from vllm_ascend.spec_decode.draft_proposer import AscendDraftModelProposer
 from vllm_ascend.spec_decode.eagle_proposer import AscendEagleProposer
+from vllm_ascend.v3.early_draft import EarlyDraft, compare_early_draft, greedy_frontier, snapshot_draft_cache
 from vllm_ascend.v3.runtime import (
     EventRecorder,
     NetworkAwarePrefixPolicy,
@@ -630,6 +631,7 @@ class NPUModelRunner(GPUModelRunner):
         self._v3_trajectory: TrajectoryKey | None = None
         self._v3_recorder: EventRecorder | None = None
         self._v3_pending_boundary: PendingBoundary | None = None
+        self._v3_early_draft: EarlyDraft | None = None
         self._v3_network_policy: NetworkAwarePrefixPolicy | None = None
         self._v3_row_bytes: list[int] | None = None
 
@@ -805,6 +807,75 @@ class NPUModelRunner(GPUModelRunner):
         if self._v3_pending_boundary is not None:
             raise RuntimeError("a V3 boundary is already pending")
         self._v3_pending_boundary = boundary
+
+    def _v3_probe_early_mtp(
+        self,
+        logits: torch.Tensor,
+        hidden_states: torch.Tensor,
+        spec_decode_metadata: SpecDecodeMetadata,
+        common_metadata: AscendCommonAttentionMetadata | None,
+        scheduler_output: SchedulerOutput,
+        batch_desc: BatchDescriptor,
+    ) -> EarlyDraft | None:
+        config = (self.vllm_config.additional_config or {}).get("v3_verdict_adaptive", {})
+        if not config.get("experimental_dv_mtp_shadow", False):
+            return None
+        if (
+            not isinstance(self.drafter, AscendEagleProposer)
+            or self.speculative_config.method != "mtp"
+            or self.speculative_config.disable_padded_drafter_batch
+            or self.drafter.use_cuda_graph
+            or not config.get("experimental_fix_mtp_padding", False)
+            or common_metadata is None
+            or self.parallel_config.data_parallel_size != 1
+        ):
+            logger.warning("V3_EARLY_MTP_SKIP unsupported proposer, metadata, or configuration")
+            return None
+
+        accepted, root = greedy_frontier(logits, spec_decode_metadata.draft_token_ids)
+        counts = torch.tensor([accepted + 1], dtype=torch.int32, device=self.device)
+        started = time.perf_counter()
+        try:
+            snapshot = snapshot_draft_cache(
+                self.compilation_config.static_forward_context,
+                list(self.drafter.attn_layer_names),
+                common_metadata.block_table_tensor[:1],
+            )
+        except UnsupportedStateSnapshot as exc:
+            logger.warning("V3_EARLY_MTP_SKIP %s", exc)
+            return None
+        torch.npu.synchronize()
+        snapshot_ms = (time.perf_counter() - started) * 1000
+        draft_started = time.perf_counter()
+        try:
+            draft_metadata, token_indices, sample_indices, rejected = self.drafter.prepare_inputs_padded(
+                common_metadata, spec_decode_metadata, counts
+            )
+            draft_ids = self.drafter._propose(
+                target_token_ids=self.input_ids.gpu[token_indices],
+                target_positions=self._get_positions(token_indices),
+                target_hidden_states=hidden_states[token_indices],
+                next_token_ids=root,
+                token_indices_to_sample=sample_indices,
+                common_attn_metadata=draft_metadata,
+                target_model_batch_desc=batch_desc,
+                sampling_metadata=self.input_batch.sampling_metadata,
+                req_scheduled_tokens=scheduler_output.num_scheduled_tokens,
+                scheduler_output=scheduler_output,
+                num_scheduled_tokens=scheduler_output.total_num_scheduled_tokens,
+                num_rejected_tokens_gpu=rejected,
+            )
+            draft_values = tuple(int(token) for token in draft_ids[0].detach().cpu().tolist())
+            root_value = int(root.detach().cpu().item())
+            draft_ms = (time.perf_counter() - draft_started) * 1000
+        finally:
+            restore_started = time.perf_counter()
+            snapshot.restore()
+            torch.npu.synchronize()
+            if not snapshot.matches():
+                raise RuntimeError("V3 early MTP draft cache restore failed")
+            restore_ms = (time.perf_counter() - restore_started) * 1000
+        return EarlyDraft(accepted, root_value, draft_values, snapshot.region_count, snapshot_ms, draft_ms, restore_ms)
 
     def _v3_sampling_supported(self, scheduler_output: SchedulerOutput) -> bool:
         sampling = self.input_batch.sampling_metadata
@@ -2489,6 +2560,7 @@ class NPUModelRunner(GPUModelRunner):
         # Run forward pass
         pending_v3 = self._v3_pending_boundary
         self._v3_pending_boundary = None
+        self._v3_early_draft = None
         v3_snapshot = None
         if pending_v3 is not None:
             assert intermediate_tensors is not None
@@ -2595,13 +2667,30 @@ class NPUModelRunner(GPUModelRunner):
                 predicted_end = greedy_matching_drafts(
                     approximate_logits, spec_decode_metadata.draft_token_ids, draft_count
                 ) + 1
-                v3_snapshot.restore()
+                requested_prefix = self._v3_choose_prefix(pending_v3, predicted_end)
                 v3_raw_config = (self.vllm_config.additional_config or {}).get("v3_verdict_adaptive", {})
+                overlap_early_mtp = bool(v3_raw_config.get("experimental_dv_mtp_shadow", False))
+                if overlap_early_mtp:
+                    pending_v3.start_request(requested_prefix)
+                self._v3_early_draft = self._v3_probe_early_mtp(
+                    approximate_logits, approximate_hidden, spec_decode_metadata,
+                    spec_decode_common_attn_metadata, scheduler_output, batch_desc,
+                )
+                if self._v3_early_draft is not None:
+                    pending_v3.send_provisional_draft(
+                        self._v3_early_draft.accepted_drafts,
+                        self._v3_early_draft.root,
+                        self._v3_early_draft.drafts,
+                    )
+                    logger.info("V3_EARLY_MTP_READY after_request=true before_residual_decode=true")
+                v3_snapshot.restore()
                 shadow_full = bool(v3_raw_config.get("prefix_shadow_full", False))
                 if shadow_full and not v3_snapshot.matches():
                     raise RuntimeError("V3 cache pages differ after DV restore")
-                requested_prefix = self._v3_choose_prefix(pending_v3, predicted_end)
-                pending_v3.request(requested_prefix)
+                if overlap_early_mtp:
+                    pending_v3.complete_request()
+                else:
+                    pending_v3.request(requested_prefix)
                 self._v3_copy_boundary(intermediate_tensors, pending_v3)
 
             hidden_states = self._model_forward(
@@ -2925,6 +3014,13 @@ class NPUModelRunner(GPUModelRunner):
                     # ngram and other speculative decoding methods use the sampled
                     # tokens on the CPU, so they are run after bookkeeping.
                     propose_draft_token_ids(valid_sampled_token_ids)
+
+                early_draft = self._v3_early_draft
+                self._v3_early_draft = None
+                if early_draft is not None and valid_sampled_token_ids and valid_sampled_token_ids[0]:
+                    exact_drafts = [int(token) for token in self._draft_token_ids[0].detach().cpu().tolist()]
+                    comparison = compare_early_draft(early_draft, valid_sampled_token_ids[0], exact_drafts)
+                    logger.info("V3_EARLY_MTP_RESULT %s", json.dumps(comparison, sort_keys=True))
 
             # vLLM v0.18 defers KV connector finalization during target-model
             # forward when speculative decoding is enabled. Finalize here after

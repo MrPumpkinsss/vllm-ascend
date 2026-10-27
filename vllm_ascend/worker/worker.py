@@ -630,6 +630,13 @@ class NPUWorker(WorkerBase):
             self.torch_allocated / GiB_bytes,
         )
 
+    @staticmethod
+    def _v3_provisional_draft_received(proposal: dict) -> None:
+        logger.info(
+            "V3_EARLY_MTP_RECEIVED boundary=%d accepted=%d drafts=%d",
+            proposal["boundary_id"], proposal["accepted_drafts"], len(proposal["drafts"]),
+        )
+
     def execute_model(
         self,
         scheduler_output: "SchedulerOutput",
@@ -1091,6 +1098,8 @@ class NPUWorker(WorkerBase):
             )
             if self.v3_transport is not None:
                 self._v3_runtime_trace = v3_config.runtime_trace
+                if v3_config.provisional_feedback and get_pp_group().is_first_rank:
+                    self.v3_transport.provisional_draft_callback = self._v3_provisional_draft_received
             else:
                 self.v2_semantic_pp = SemanticPPTransport.from_env(
                     sender=get_pp_group().is_first_rank

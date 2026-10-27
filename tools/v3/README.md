@@ -21,6 +21,23 @@ trajectory, is restricted to one request without context parallelism,
 synchronizes counts to the CPU, and has no general correctness or performance
 guarantee.
 
+The opt-in `experimental_dv_mtp_shadow` path runs a provisional native MTP
+proposal from the approximate DV result. It snapshots and restores draft-cache
+pages and sends the uncommitted chain back to the first PP stage while the
+requested residual is in flight. The receiver exposes a boundary-tagged
+callback, but does not run ahead or promote the proposal. This diagnostic
+requires prefix verification, `experimental_fix_mtp_padding`, one greedy
+request, and an eager padded MTP proposer. It synchronizes to the CPU and is
+not a performance-ready implementation. The authoritative proposer still runs
+after VV, so the diagnostic duplicates draft work. Its boundary identifier is
+only valid for the current serialized single-request transport.
+
+One Qwen3.5 27B PP2 greedy workload exercised 107 early drafts and delivered
+all 107 to the first stage; 97 provisional next chains matched their later
+authoritative chains. The 16 requests and their acceptance traces matched a
+same-settings P4 control and a no-DV unpadded-eager reference. This is a
+limited diagnostic, not a general correctness or network-speedup claim.
+
 The A-side optimistic runahead and a real fused `VV(t)+DV(t+1)` engine batch
 are not implemented. Existing codec, socket, and limited engine checks do not
 constitute a general exactness or performance guarantee. The experimental

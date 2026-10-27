@@ -291,6 +291,147 @@ def test_pending_boundary_requires_repair_before_finish(tmp_path):
     assert sender.suffix_requests == receiver.suffix_requests == 1
 
 
+def test_split_request_allows_work_before_residual_receive(tmp_path, monkeypatch):
+    _codec(tmp_path)
+    tensor = torch.randn((8, 32), generator=torch.Generator().manual_seed(302)).to(torch.bfloat16)
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+    kwargs = dict(
+        listen_host="127.0.0.1", listen_port=port, connect_host="127.0.0.1", connect_port=port,
+        calibration_path=str(tmp_path / "tables.npz"), adaptive=True, default_prefix_length=4,
+    )
+    sender = VerdictAdaptiveTransport(sender=True, provisional_feedback=True, **kwargs)
+    receiver = VerdictAdaptiveTransport(sender=False, **kwargs)
+    sender_received_request = threading.Event()
+    proposal_received = threading.Event()
+    residual_send_started = threading.Event()
+    release_residual_send = threading.Event()
+    proposals: list[dict] = []
+
+    def receive_proposal(proposal):
+        proposals.append(proposal)
+        proposal_received.set()
+
+    sender.provisional_draft_callback = receive_proposal
+    encode = sender._encode_residual_rows
+    send_residual = sender._send_residual_frame
+
+    def record_request(boundary, rows):
+        sender_received_request.set()
+        return encode(boundary, rows)
+
+    def delayed_send(sock, header, body):
+        residual_send_started.set()
+        if not release_residual_send.wait(timeout=20):
+            raise TimeoutError("residual send was not released")
+        send_residual(sock, header, body)
+
+    monkeypatch.setattr(sender, "_encode_residual_rows", record_request)
+    monkeypatch.setattr(sender, "_send_residual_frame", delayed_send)
+    errors: list[Exception] = []
+
+    def send():
+        try:
+            sender.send_tensor_dict({"hidden_states": tensor})
+        except Exception as exc:
+            errors.append(exc)
+
+    thread = threading.Thread(target=send)
+    thread.start()
+    boundary = receiver.begin_boundary()
+    try:
+        boundary.start_request(4)
+        with pytest.raises(ValueError):
+            boundary.start_request(8)
+        with pytest.raises(ValueError):
+            boundary.finish(0)
+        assert sender_received_request.wait(timeout=20)
+        assert residual_send_started.wait(timeout=20)
+        with pytest.raises(ValueError):
+            boundary.send_provisional_draft(8, 42, (1, 2, 3, 4, 5, 6, 7))
+        boundary.send_provisional_draft(2, 42, (1, 2, 3, 4, 5, 6, 7))
+        with pytest.raises(ValueError):
+            boundary.send_provisional_draft(2, 42, (1, 2, 3, 4, 5, 6, 7))
+        assert proposal_received.wait(timeout=20)
+        assert thread.is_alive()
+        assert not release_residual_send.is_set()
+        release_residual_send.set()
+        partial = boundary.complete_request()["hidden_states"]
+        assert torch.equal(partial[:4], tensor[:4])
+        with pytest.raises(ValueError):
+            boundary.complete_request()
+        boundary.start_request(8)
+        full = boundary.complete_request()["hidden_states"]
+        assert torch.equal(full, tensor)
+        boundary.finish(8)
+    finally:
+        release_residual_send.set()
+        if not boundary.closed:
+            boundary.abort()
+    thread.join(timeout=20)
+    assert not thread.is_alive()
+    assert not errors
+    assert sender.suffix_requests == receiver.suffix_requests == 1
+    assert len(proposals) == 1
+    assert proposals[0]["accepted_drafts"] == 2
+    assert proposals[0]["root"] == 42
+    assert proposals[0]["drafts"] == [1, 2, 3, 4, 5, 6, 7]
+    assert sender.last_provisional_draft == proposals[0]
+
+
+def test_duplex_residual_send_failure_unblocks_receiver(tmp_path, monkeypatch):
+    _codec(tmp_path)
+    tensor = torch.randn((8, 32), generator=torch.Generator().manual_seed(303)).to(torch.bfloat16)
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+    kwargs = dict(
+        listen_host="127.0.0.1", listen_port=port, connect_host="127.0.0.1", connect_port=port,
+        calibration_path=str(tmp_path / "tables.npz"), adaptive=True,
+    )
+    sender = VerdictAdaptiveTransport(sender=True, provisional_feedback=True, **kwargs)
+    receiver = VerdictAdaptiveTransport(sender=False, **kwargs)
+    errors: list[Exception] = []
+
+    def fail_send(sock, header, body):
+        raise OSError("injected residual send failure")
+
+    def send():
+        try:
+            sender.send_tensor_dict({"hidden_states": tensor})
+        except Exception as exc:
+            errors.append(exc)
+
+    monkeypatch.setattr(sender, "_send_residual_frame", fail_send)
+    thread = threading.Thread(target=send)
+    thread.start()
+    boundary = receiver.begin_boundary()
+    boundary.start_request(4)
+    with pytest.raises(OSError):
+        boundary.complete_request()
+    thread.join(timeout=20)
+    assert not thread.is_alive()
+    assert errors and boundary.closed
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"boundary_id": 12},
+        {"accepted_drafts": 8},
+        {"root": -1},
+        {"drafts": [1, 2]},
+        {"drafts": [1, 2, 3, 4, 5, 6, -1]},
+    ],
+)
+def test_provisional_draft_rejects_stale_or_invalid_metadata(change):
+    proposal = {"version": 1, "boundary_id": 11, "accepted_drafts": 2, "root": 42, "drafts": list(range(7))}
+    proposal.update(change)
+    with pytest.raises(ValueError):
+        VerdictAdaptiveTransport._validate_provisional_draft(proposal, 8, 11)
+
+
 def test_background_frames_remain_ordered(tmp_path, monkeypatch):
     _codec(tmp_path)
     tensors = [torch.randn((8, 32), generator=torch.Generator().manual_seed(seed)).to(torch.bfloat16)
@@ -394,6 +535,7 @@ def test_additional_config_is_spawn_safe():
                 "connect": "127.0.0.1:2",
                 "prefix_repair": True,
                 "prefix_length": 6,
+                "experimental_dv_mtp_shadow": True,
             }
         }
     )
@@ -401,6 +543,8 @@ def test_additional_config_is_spawn_safe():
     assert config.calibration_path == "/tmp/tables.npz"
     assert config.adaptive
     assert config.prefix_length == 6
+    assert config.provisional_feedback
+    assert not V3TransportConfig.from_vllm_config({}).provisional_feedback
 
 
 def test_transport_full_residual_is_exact(tmp_path):

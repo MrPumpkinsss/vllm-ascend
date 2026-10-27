@@ -43,6 +43,7 @@ class V3TransportConfig:
     runtime_trace: str = ""
     codec: str = "nvfp4"
     engine_prefix_vv: bool = False
+    provisional_feedback: bool = False
 
     @classmethod
     def from_env(cls) -> V3TransportConfig:
@@ -78,6 +79,7 @@ class V3TransportConfig:
         config.runtime_trace = str(raw.get("runtime_trace", config.runtime_trace))
         config.codec = str(raw.get("codec", config.codec)).lower()
         config.engine_prefix_vv = bool(raw.get("engine_prefix_vv", config.engine_prefix_vv))
+        config.provisional_feedback = bool(raw.get("experimental_dv_mtp_shadow", False))
         if config.codec not in {"nvfp4", "raw"}:
             raise ValueError(f"unsupported V3 codec {config.codec}")
         return config
@@ -138,14 +140,36 @@ class PendingBoundary:
         self.row_bytes: list[int | None] = [None] * self.total_rows
         self.requested = False
         self.closed = False
+        self._inflight_prefix: int | None = None
+        self._provisional_sent = False
 
     def request(self, prefix_length: int) -> dict[str, Any]:
+        self.start_request(prefix_length)
+        return self.complete_request()
+
+    def start_request(self, prefix_length: int) -> None:
+        """Send a residual request without waiting for the response."""
         empty_initial = not self.requested and self.total_rows == 0 and prefix_length == 0
-        if self.closed or (not empty_initial and prefix_length <= self.exact_rows) or prefix_length > self.total_rows:
+        if (
+            self.closed or self._inflight_prefix is not None
+            or (not empty_initial and prefix_length <= self.exact_rows) or prefix_length > self.total_rows
+        ):
             raise ValueError("invalid or closed V3 boundary request")
         kind = "RESIDUAL_REQUEST" if not self.requested else "SUFFIX_REQUEST"
         try:
-            header, body = self.transport._request_residual(prefix_length, self.metadata, kind=kind)
+            self.transport._send_residual_request(prefix_length, self.metadata, kind=kind)
+            self._inflight_prefix = prefix_length
+        except BaseException:
+            self.abort()
+            raise
+
+    def complete_request(self) -> dict[str, Any]:
+        """Receive and decode the one outstanding residual response."""
+        if self.closed or self._inflight_prefix is None:
+            raise ValueError("no V3 boundary request is in flight")
+        prefix_length = self._inflight_prefix
+        try:
+            header, body = self.transport._receive_residual()
             self.tensors = self.transport._decode_residual(
                 self.approximate, self.metadata, header, body, previous=self.tensors
             )
@@ -166,13 +190,38 @@ class PendingBoundary:
                 self.transport.suffix_requests += 1
             self.requested = True
             self.exact_rows = prefix_length
+            self._inflight_prefix = None
             return self.tensors
         except BaseException:
             self.abort()
             raise
 
+    def send_provisional_draft(self, accepted_drafts: int, root: int, drafts: tuple[int, ...]) -> None:
+        """Send an uncommitted next-chain hint for the current boundary."""
+        if self.closed or self._inflight_prefix is None or self.requested or self._provisional_sent:
+            raise ValueError("provisional draft requires an in-flight initial request")
+        boundary_id = self.metadata.get("boundary_id")
+        proposal = {
+            "version": 1,
+            "boundary_id": boundary_id,
+            "accepted_drafts": accepted_drafts,
+            "root": root,
+            "drafts": list(drafts),
+        }
+        self.transport._validate_provisional_draft(proposal, self.total_rows, boundary_id)
+        try:
+            with self.transport._send_lock:
+                send_frame(self.transport._ensure_socket(), "EARLY_DRAFT", proposal)
+            self._provisional_sent = True
+        except BaseException:
+            self.abort()
+            raise
+
     def finish(self, consumed_end: int) -> None:
-        if self.closed or not self.requested or not 0 <= consumed_end <= self.exact_rows:
+        if (
+            self.closed or self._inflight_prefix is not None or not self.requested
+            or not 0 <= consumed_end <= self.exact_rows
+        ):
             raise ValueError("cannot finish V3 boundary beyond the exact prefix")
         try:
             send_frame(self.transport._ensure_socket(), "BOUNDARY_DONE", {"version": 1})
@@ -183,6 +232,7 @@ class PendingBoundary:
 
     def abort(self) -> None:
         self.closed = True
+        self._inflight_prefix = None
         self.transport._shutdown_socket()
 
 
@@ -201,6 +251,7 @@ class VerdictAdaptiveTransport:
         adaptive: bool = False,
         default_prefix_length: int = 8,
         codec_mode: str = "nvfp4",
+        provisional_feedback: bool = False,
     ):
         self.listen_host, self.listen_port = listen_host, listen_port
         self.connect_host, self.connect_port = connect_host, connect_port
@@ -208,6 +259,7 @@ class VerdictAdaptiveTransport:
         self.adaptive = adaptive
         self.default_prefix_length = default_prefix_length
         self.codec_mode = codec_mode
+        self.provisional_feedback = provisional_feedback
         if not calibration_path:
             raise ValueError("V3 transport requires VLLM_ASCEND_V3_CALIBRATION")
         hidden_size = NVFP4ExactCodec.read_hidden_size(calibration_path)
@@ -229,6 +281,9 @@ class VerdictAdaptiveTransport:
         self.policy_decisions = 0
         self.policy_last_prefix = 0
         self._policy_row_bytes: list[int] | None = None
+        self.provisional_draft_callback: Callable[[dict[str, Any]], None] | None = None
+        self.last_provisional_draft: dict[str, Any] | None = None
+        self.provisional_drafts_received = 0
 
     @classmethod
     def from_config(cls, config: V3TransportConfig, *, sender: bool) -> VerdictAdaptiveTransport | None:
@@ -254,6 +309,7 @@ class VerdictAdaptiveTransport:
             adaptive=config.adaptive,
             default_prefix_length=config.prefix_length,
             codec_mode=config.codec,
+            provisional_feedback=config.provisional_feedback,
         )
 
     def _ensure_socket(self) -> socket.socket:
@@ -450,8 +506,22 @@ class VerdictAdaptiveTransport:
             self._shutdown_socket()
             raise
 
+    @staticmethod
+    def _send_residual_frame(sock: socket.socket, header: dict[str, Any], body: bytes) -> None:
+        send_frame(sock, "RESIDUAL", header, body)
+
+    def _send_residual_duplex(
+        self, sock: socket.socket, header: dict[str, Any], body: bytes, errors: list[BaseException]
+    ) -> None:
+        try:
+            self._send_residual_frame(sock, header, body)
+        except BaseException as exc:
+            errors.append(exc)
+            self._shutdown_socket()
+
     def _send_tensor_dict(self, tensor_dict: dict[str, Any]) -> None:
         self.flush()
+        self.last_provisional_draft = None
         started = time.perf_counter()
         entries, semantic, anchor_body, anchor_bytes, reference_bytes = self._prepare_boundary(tensor_dict)
         sock = self._ensure_socket()
@@ -461,6 +531,7 @@ class VerdictAdaptiveTransport:
                 "ANCHOR",
                 {
                     "version": 1,
+                    "boundary_id": self.boundaries + 1,
                     "entries": entries,
                     "adaptive": self.adaptive,
                     "codec": self.codec_mode,
@@ -521,14 +592,39 @@ class VerdictAdaptiveTransport:
                 )
                 for key, start, payloads in selected
             ]
-            send_frame(
-                sock,
-                "RESIDUAL",
-                {"version": 1, "entries": residual_entries},
-                b"".join(residual_payloads),
-            )
+            residual_header = {"version": 1, "entries": residual_entries}
+            residual_body = b"".join(residual_payloads)
+            send_errors: list[BaseException] = []
+            send_thread = None
+            if self.provisional_feedback:
+                send_thread = threading.Thread(
+                    target=self._send_residual_duplex,
+                    args=(sock, residual_header, residual_body, send_errors),
+                    daemon=True,
+                )
+                send_thread.start()
+            else:
+                self._send_residual_frame(sock, residual_header, residual_body)
+            try:
+                verdict = recv_frame(sock)
+                while verdict.kind == "EARLY_DRAFT":
+                    if not self.provisional_feedback or self.last_provisional_draft is not None or verdict.body:
+                        raise RuntimeError("unexpected, duplicate, or invalid V3 provisional draft")
+                    self._validate_provisional_draft(verdict.header, max_rows, self.boundaries)
+                    self.last_provisional_draft = dict(verdict.header)
+                    self.provisional_drafts_received += 1
+                    if self.provisional_draft_callback is not None:
+                        self.provisional_draft_callback(dict(verdict.header))
+                    verdict = recv_frame(sock)
+            except BaseException:
+                self._shutdown_socket()
+                raise
+            finally:
+                if send_thread is not None:
+                    send_thread.join()
+            if send_errors:
+                raise RuntimeError("V3 duplex residual sender failed") from send_errors[0]
             self.residual_wire_bytes += residual_bytes
-            verdict = recv_frame(sock)
             if verdict.kind == "BOUNDARY_DONE":
                 break
             if verdict.kind != "SUFFIX_REQUEST":
@@ -593,6 +689,7 @@ class VerdictAdaptiveTransport:
         self.bf16_reference_bytes += reference_bytes
         metadata = {
             "adaptive": bool(frame.header.get("adaptive", False)),
+            "boundary_id": frame.header.get("boundary_id"),
             "codec": str(frame.header.get("codec", "nvfp4")),
             "entries": semantic_entries,
             "anchor_codes": anchor_codes,
@@ -604,9 +701,18 @@ class VerdictAdaptiveTransport:
     def _request_residual(
         self, prefix_length: int, metadata: dict[str, Any], *, kind: str = "RESIDUAL_REQUEST"
     ) -> tuple[dict[str, Any], bytes]:
+        self._send_residual_request(prefix_length, metadata, kind=kind)
+        return self._receive_residual()
+
+    def _send_residual_request(
+        self, prefix_length: int, metadata: dict[str, Any], *, kind: str = "RESIDUAL_REQUEST"
+    ) -> None:
         sock = self._ensure_socket()
         lengths: dict[str, int] = {key: min(prefix_length, entry.rows) for key, entry in metadata["entries"].items()}
         send_frame(sock, kind, {"version": 1, "prefix_length": prefix_length, "lengths": lengths})
+
+    def _receive_residual(self) -> tuple[dict[str, Any], bytes]:
+        sock = self._ensure_socket()
         frame = recv_frame(sock)
         if frame.kind != "RESIDUAL":
             raise RuntimeError(f"V3 receiver expected RESIDUAL, got {frame.kind}")
@@ -787,6 +893,21 @@ class VerdictAdaptiveTransport:
         return result
 
     @staticmethod
+    def _validate_provisional_draft(proposal: dict[str, Any], rows: int, boundary_id: int | None) -> None:
+        accepted = proposal.get("accepted_drafts")
+        root = proposal.get("root")
+        drafts = proposal.get("drafts")
+        if (
+            proposal.get("version") != 1 or type(boundary_id) is not int
+            or proposal.get("boundary_id") != boundary_id or rows < 2
+            or type(accepted) is not int or not 0 <= accepted < rows
+            or type(root) is not int or root < 0
+            or not isinstance(drafts, list) or len(drafts) != rows - 1
+            or any(type(token) is not int or token < 0 for token in drafts)
+        ):
+            raise ValueError("invalid or mismatched V3 provisional draft")
+
+    @staticmethod
     def _validate_decoded_prefix(metadata: dict[str, Any], prefix_length: int) -> None:
         for key, entry in metadata["entries"].items():
             if metadata["decoded_rows"][key] != min(prefix_length, entry.rows):
@@ -803,6 +924,7 @@ class VerdictAdaptiveTransport:
         wire = self.anchor_wire_bytes + self.residual_wire_bytes
         return {
             "boundaries": self.boundaries,
+            "provisional_drafts_received": self.provisional_drafts_received,
             "wire_bytes": wire,
             "anchor_wire_bytes": self.anchor_wire_bytes,
             "residual_wire_bytes": self.residual_wire_bytes,
