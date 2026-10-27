@@ -25,6 +25,7 @@ from typing import Any, Callable
 import numpy as np
 import torch
 
+from .early_draft import V3_SEMANTIC_VERIFY_ROWS
 from .nvfp4_codec import NVFP4CodecConfig, NVFP4ExactCodec
 from .protocol import recv_frame, send_frame
 from .runtime import NetworkAwarePrefixPolicy
@@ -44,6 +45,7 @@ class V3TransportConfig:
     codec: str = "nvfp4"
     engine_prefix_vv: bool = False
     provisional_feedback: bool = False
+    fused_vv_dv: bool = False
 
     @classmethod
     def from_env(cls) -> V3TransportConfig:
@@ -80,6 +82,7 @@ class V3TransportConfig:
         config.codec = str(raw.get("codec", config.codec)).lower()
         config.engine_prefix_vv = bool(raw.get("engine_prefix_vv", config.engine_prefix_vv))
         config.provisional_feedback = bool(raw.get("experimental_dv_mtp_shadow", False))
+        config.fused_vv_dv = bool(raw.get("experimental_fused_vv_dv", False))
         if config.codec not in {"nvfp4", "raw"}:
             raise ValueError(f"unsupported V3 codec {config.codec}")
         return config
@@ -163,7 +166,7 @@ class PendingBoundary:
             self.abort()
             raise
 
-    def complete_request(self) -> dict[str, Any]:
+    def complete_request(self, *, keep_approximate_suffix: bool = False) -> dict[str, Any]:
         """Receive and decode the one outstanding residual response."""
         if self.closed or self._inflight_prefix is None:
             raise ValueError("no V3 boundary request is in flight")
@@ -184,7 +187,7 @@ class PendingBoundary:
                 if count == len(self.metadata["entries"]):
                     self.row_bytes[index] = sizes[index]
             for key, entry in self.metadata["entries"].items():
-                if prefix_length < entry.rows:
+                if prefix_length < entry.rows and not keep_approximate_suffix:
                     self.tensors[key][prefix_length:].zero_()
             if self.requested:
                 self.transport.suffix_requests += 1
@@ -207,6 +210,7 @@ class PendingBoundary:
             "accepted_drafts": accepted_drafts,
             "root": root,
             "drafts": list(drafts),
+            "draft_rows": V3_SEMANTIC_VERIFY_ROWS,
         }
         self.transport._validate_provisional_draft(proposal, self.total_rows, boundary_id)
         try:
@@ -897,12 +901,14 @@ class VerdictAdaptiveTransport:
         accepted = proposal.get("accepted_drafts")
         root = proposal.get("root")
         drafts = proposal.get("drafts")
+        draft_rows = proposal.get("draft_rows", rows)
         if (
             proposal.get("version") != 1 or type(boundary_id) is not int
             or proposal.get("boundary_id") != boundary_id or rows < 2
-            or type(accepted) is not int or not 0 <= accepted < rows
+            or type(draft_rows) is not int or not 2 <= draft_rows <= rows
+            or type(accepted) is not int or not 0 <= accepted < draft_rows
             or type(root) is not int or root < 0
-            or not isinstance(drafts, list) or len(drafts) != rows - 1
+            or not isinstance(drafts, list) or len(drafts) != draft_rows - 1
             or any(type(token) is not int or token < 0 for token in drafts)
         ):
             raise ValueError("invalid or mismatched V3 provisional draft")

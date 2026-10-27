@@ -536,6 +536,7 @@ def test_additional_config_is_spawn_safe():
                 "prefix_repair": True,
                 "prefix_length": 6,
                 "experimental_dv_mtp_shadow": True,
+                "experimental_fused_vv_dv": True,
             }
         }
     )
@@ -544,7 +545,9 @@ def test_additional_config_is_spawn_safe():
     assert config.adaptive
     assert config.prefix_length == 6
     assert config.provisional_feedback
+    assert config.fused_vv_dv
     assert not V3TransportConfig.from_vllm_config({}).provisional_feedback
+    assert not V3TransportConfig.from_vllm_config({}).fused_vv_dv
 
 
 def test_transport_full_residual_is_exact(tmp_path):
@@ -612,3 +615,50 @@ def test_transport_raw_bf16_mode(tmp_path):
     thread.join(timeout=20)
     assert not thread.is_alive()
     assert torch.equal(received[0], tensor)
+
+def test_greedy_frontier_limits_fused_first_block():
+    from vllm_ascend.v3.early_draft import greedy_frontier
+
+    logits = torch.zeros((16, 8), dtype=torch.float32)
+    drafts = torch.arange(1, 16, dtype=torch.int32)
+    # Only the first seven comparisons match; the fused suffix is ignored.
+    for row, token in enumerate(drafts[:7]):
+        logits[row, token] = 8.0
+    accepted, root = greedy_frontier(logits, drafts, limit=7)
+    assert accepted == 7
+    assert int(root) == 0
+
+
+def test_fused_boundary_keeps_approximate_suffix(tmp_path):
+    _codec(tmp_path)
+    tensor = torch.randn((16, 32), generator=torch.Generator().manual_seed(401)).to(torch.bfloat16)
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+    kwargs = dict(
+        listen_host="127.0.0.1", listen_port=port, connect_host="127.0.0.1", connect_port=port,
+        calibration_path=str(tmp_path / "tables.npz"), adaptive=True, default_prefix_length=8,
+    )
+    sender = VerdictAdaptiveTransport(sender=True, provisional_feedback=True, **kwargs)
+    receiver = VerdictAdaptiveTransport(sender=False, **kwargs)
+    errors: list[Exception] = []
+
+    def receive():
+        try:
+            boundary = receiver.begin_boundary()
+            boundary.start_request(8)
+            boundary.send_provisional_draft(7, 42, tuple(range(1, 8)))
+            result = boundary.complete_request(keep_approximate_suffix=True)["hidden_states"]
+            assert torch.equal(result[:8], tensor[:8])
+            assert torch.count_nonzero(result[8:]) > 0
+            boundary.finish(8)
+        except Exception as exc:
+            errors.append(exc)
+
+    thread = threading.Thread(target=receive)
+    thread.start()
+    sender.send_tensor_dict({"hidden_states": tensor})
+    thread.join(timeout=20)
+    assert not thread.is_alive()
+    assert not errors
+    assert sender.stats()["provisional_drafts_received"] == 1

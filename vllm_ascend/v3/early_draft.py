@@ -10,6 +10,10 @@ import torch
 from vllm_ascend.v3.state_snapshot import IndexedStateSnapshot, UnsupportedStateSnapshot
 from vllm_ascend.v3.verification import greedy_matching_drafts
 
+# A fused MTP-15 engine batch is two semantic K=8 blocks.
+V3_SEMANTIC_VERIFY_ROWS = 8
+V3_FUSED_VERIFY_ROWS = 2 * V3_SEMANTIC_VERIFY_ROWS
+
 
 @dataclass(frozen=True)
 class EarlyDraft:
@@ -22,11 +26,16 @@ class EarlyDraft:
     restore_ms: float
 
 
-def greedy_frontier(logits: torch.Tensor, draft_ids: torch.Tensor) -> tuple[int, torch.Tensor]:
+def greedy_frontier(
+    logits: torch.Tensor, draft_ids: torch.Tensor, limit: int | None = None
+) -> tuple[int, torch.Tensor]:
     """Return the guessed accepted length and next root without committing it."""
     if logits.ndim != 2 or draft_ids.ndim != 1 or logits.shape[0] != len(draft_ids) + 1:
         raise ValueError("expected K logits and K-1 draft tokens")
-    accepted = greedy_matching_drafts(logits, draft_ids, len(draft_ids))
+    checked = len(draft_ids) if limit is None else min(int(limit), len(draft_ids))
+    if checked < 1:
+        raise ValueError("a greedy frontier requires at least one draft token")
+    accepted = greedy_matching_drafts(logits, draft_ids, checked)
     return accepted, logits[accepted].argmax().reshape(1).to(dtype=torch.int32)
 
 

@@ -146,7 +146,14 @@ from vllm_ascend.spec_decode import get_spec_decode_method
 from vllm_ascend.spec_decode.dflash_proposer import AscendDflashProposer
 from vllm_ascend.spec_decode.draft_proposer import AscendDraftModelProposer
 from vllm_ascend.spec_decode.eagle_proposer import AscendEagleProposer
-from vllm_ascend.v3.early_draft import EarlyDraft, compare_early_draft, greedy_frontier, snapshot_draft_cache
+from vllm_ascend.v3.early_draft import (
+    V3_FUSED_VERIFY_ROWS,
+    V3_SEMANTIC_VERIFY_ROWS,
+    EarlyDraft,
+    compare_early_draft,
+    greedy_frontier,
+    snapshot_draft_cache,
+)
 from vllm_ascend.v3.runtime import (
     EventRecorder,
     NetworkAwarePrefixPolicy,
@@ -632,6 +639,8 @@ class NPUModelRunner(GPUModelRunner):
         self._v3_recorder: EventRecorder | None = None
         self._v3_pending_boundary: PendingBoundary | None = None
         self._v3_early_draft: EarlyDraft | None = None
+        self._v3_fused_limit: int | None = None
+        self._v3_fused_next_drafts: torch.Tensor | None = None
         self._v3_network_policy: NetworkAwarePrefixPolicy | None = None
         self._v3_row_bytes: list[int] | None = None
 
@@ -816,6 +825,7 @@ class NPUModelRunner(GPUModelRunner):
         common_metadata: AscendCommonAttentionMetadata | None,
         scheduler_output: SchedulerOutput,
         batch_desc: BatchDescriptor,
+        draft_limit: int | None = None,
     ) -> EarlyDraft | None:
         config = (self.vllm_config.additional_config or {}).get("v3_verdict_adaptive", {})
         if not config.get("experimental_dv_mtp_shadow", False):
@@ -832,7 +842,9 @@ class NPUModelRunner(GPUModelRunner):
             logger.warning("V3_EARLY_MTP_SKIP unsupported proposer, metadata, or configuration")
             return None
 
-        accepted, root = greedy_frontier(logits, spec_decode_metadata.draft_token_ids)
+        accepted, root = greedy_frontier(
+            logits, spec_decode_metadata.draft_token_ids, limit=draft_limit
+        )
         counts = torch.tensor([accepted + 1], dtype=torch.int32, device=self.device)
         started = time.perf_counter()
         try:
@@ -865,7 +877,12 @@ class NPUModelRunner(GPUModelRunner):
                 num_scheduled_tokens=scheduler_output.total_num_scheduled_tokens,
                 num_rejected_tokens_gpu=rejected,
             )
-            draft_values = tuple(int(token) for token in draft_ids[0].detach().cpu().tolist())
+            proposed_values = [int(token) for token in draft_ids[0].detach().cpu().tolist()]
+            if draft_limit is not None:
+                if len(proposed_values) < int(draft_limit):
+                    raise RuntimeError("V3 early MTP returned fewer drafts than requested")
+                proposed_values = proposed_values[: int(draft_limit)]
+            draft_values = tuple(proposed_values)
             root_value = int(root.detach().cpu().item())
             draft_ms = (time.perf_counter() - draft_started) * 1000
         finally:
@@ -952,7 +969,13 @@ class NPUModelRunner(GPUModelRunner):
             min(1, pp_group.world_size - 1),
             pp_group.world_size,
         )[0]
-        fused = "separate"
+        raw_v3 = (self.vllm_config.additional_config or {}).get("v3_verdict_adaptive", {})
+        fused = (
+            "fused-vv-dv"
+            if raw_v3.get("experimental_fused_vv_dv", False)
+            and 1 + int(self.num_spec_tokens or 0) == V3_FUSED_VERIFY_ROWS
+            else "separate"
+        )
         self._v3_trajectory = TrajectoryKey(
             model_version=self.model_config.model,
             cut_point=cut_point,
@@ -2561,14 +2584,23 @@ class NPUModelRunner(GPUModelRunner):
         pending_v3 = self._v3_pending_boundary
         self._v3_pending_boundary = None
         self._v3_early_draft = None
+        self._v3_fused_limit = None
+        self._v3_fused_next_drafts = None
         v3_snapshot = None
         if pending_v3 is not None:
             assert intermediate_tensors is not None
             model_type = getattr(self.model_config.hf_text_config, "model_type", "")
             sampling_supported = self._v3_sampling_supported(scheduler_output)
+            raw_v3_config = (self.vllm_config.additional_config or {}).get("v3_verdict_adaptive", {})
+            fused_mode = bool(raw_v3_config.get("experimental_fused_vv_dv", False))
+            supported_rows = V3_FUSED_VERIFY_ROWS if fused_mode else V3_SUPPORTED_VERIFY_ROWS
             supported = (
                 model_type.startswith("qwen3_5")
-                and pending_v3.total_rows == V3_SUPPORTED_VERIFY_ROWS
+                and pending_v3.total_rows == supported_rows
+                and (
+                    not fused_mode
+                    or 1 + int(self.num_spec_tokens or 0) == V3_FUSED_VERIFY_ROWS
+                )
                 and self.input_batch.num_reqs == 1
                 and self.parallel_config.tensor_parallel_size == 1
                 and self.pcp_size == 1
@@ -2660,22 +2692,39 @@ class NPUModelRunner(GPUModelRunner):
             if pending_v3 is not None:
                 assert v3_snapshot is not None and spec_decode_metadata is not None
                 draft_count = len(spec_decode_metadata.draft_token_ids)
+                v3_raw_config = (self.vllm_config.additional_config or {}).get("v3_verdict_adaptive", {})
+                fused_mode = (
+                    bool(v3_raw_config.get("experimental_fused_vv_dv", False))
+                    and pending_v3.total_rows == V3_FUSED_VERIFY_ROWS
+                    and draft_count == V3_FUSED_VERIFY_ROWS - 1
+                )
+                semantic_draft_count = V3_SEMANTIC_VERIFY_ROWS - 1 if fused_mode else draft_count
                 approximate_hidden = self._model_forward(
                     num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
                 )
                 approximate_logits = self.model.compute_logits(approximate_hidden[logits_indices])
                 predicted_end = greedy_matching_drafts(
-                    approximate_logits, spec_decode_metadata.draft_token_ids, draft_count
+                    approximate_logits, spec_decode_metadata.draft_token_ids, semantic_draft_count
                 ) + 1
-                requested_prefix = self._v3_choose_prefix(pending_v3, predicted_end)
-                v3_raw_config = (self.vllm_config.additional_config or {}).get("v3_verdict_adaptive", {})
+                requested_prefix = (
+                    V3_SEMANTIC_VERIFY_ROWS
+                    if fused_mode
+                    else self._v3_choose_prefix(pending_v3, predicted_end)
+                )
                 overlap_early_mtp = bool(v3_raw_config.get("experimental_dv_mtp_shadow", False))
                 if overlap_early_mtp:
                     pending_v3.start_request(requested_prefix)
                 self._v3_early_draft = self._v3_probe_early_mtp(
-                    approximate_logits, approximate_hidden, spec_decode_metadata,
-                    spec_decode_common_attn_metadata, scheduler_output, batch_desc,
+                    approximate_logits,
+                    approximate_hidden,
+                    spec_decode_metadata,
+                    spec_decode_common_attn_metadata,
+                    scheduler_output,
+                    batch_desc,
+                    draft_limit=semantic_draft_count if fused_mode else None,
                 )
+                if fused_mode and self._v3_early_draft is None:
+                    raise RuntimeError("V3 fused VV+DV requires a provisional MTP chain")
                 if self._v3_early_draft is not None:
                     pending_v3.send_provisional_draft(
                         self._v3_early_draft.accepted_drafts,
@@ -2688,7 +2737,7 @@ class NPUModelRunner(GPUModelRunner):
                 if shadow_full and not v3_snapshot.matches():
                     raise RuntimeError("V3 cache pages differ after DV restore")
                 if overlap_early_mtp:
-                    pending_v3.complete_request()
+                    pending_v3.complete_request(keep_approximate_suffix=fused_mode)
                 else:
                     pending_v3.request(requested_prefix)
                 self._v3_copy_boundary(intermediate_tensors, pending_v3)
@@ -2699,65 +2748,132 @@ class NPUModelRunner(GPUModelRunner):
             if pending_v3 is not None:
                 assert v3_snapshot is not None and spec_decode_metadata is not None
                 exact_logits = self.model.compute_logits(hidden_states[logits_indices])
-                limit = min(draft_count, requested_prefix)
-                accepted = greedy_matching_drafts(exact_logits, spec_decode_metadata.draft_token_ids, limit)
-                repaired = requested_prefix < pending_v3.total_rows and accepted == requested_prefix
-                if repaired or shadow_full:
-                    if shadow_full:
-                        partial_hidden = hidden_states[:requested_prefix].clone()
-                        partial_logits = exact_logits[:requested_prefix].clone()
-                        partial_gdn = snapshot_gdn_committed_state(
-                            self.compilation_config.static_forward_context,
-                            attn_metadata,
-                            min(accepted + 1, requested_prefix),
-                        )
-                        partial_attention = snapshot_attention_committed_state(
-                            self.compilation_config.static_forward_context,
-                            attn_metadata,
-                            min(accepted + 1, requested_prefix),
-                        )
-                    v3_snapshot.restore()
-                    if shadow_full and not v3_snapshot.matches():
-                        raise RuntimeError("V3 cache pages differ after VV restore")
-                    if requested_prefix < pending_v3.total_rows:
-                        pending_v3.request(pending_v3.total_rows)
-                        self._v3_copy_boundary(intermediate_tensors, pending_v3)
-                    hidden_states = self._model_forward(
-                        num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
-                    )
-                    exact_logits = self.model.compute_logits(hidden_states[logits_indices])
-                    if shadow_full:
-                        full_hidden = hidden_states[:requested_prefix]
-                        full_logits = exact_logits[:requested_prefix]
-                        logger.info(
-                            "V3_PREFIX_SHADOW prefix=%d hidden_equal=%s logits_equal=%s gdn_prefix_equal=%s "
-                            "attention_prefix_equal=%s hidden_max=%g logits_max=%g gdn_diffs=%s attention_diffs=%s",
-                            requested_prefix,
-                            tensors_bitwise_equal(partial_hidden, full_hidden),
-                            tensors_bitwise_equal(partial_logits, full_logits),
-                            partial_gdn.matches(),
-                            partial_attention.matches(),
-                            (partial_hidden.float() - full_hidden.float()).abs().max().item(),
-                            (partial_logits.float() - full_logits.float()).abs().max().item(),
-                            partial_gdn.differences(limit=2),
-                            partial_attention.differences(limit=2),
-                        )
-                    accepted = greedy_matching_drafts(exact_logits, spec_decode_metadata.draft_token_ids, draft_count)
-                consumed_end = accepted + 1
-                pending_v3.finish(consumed_end)
-                self._v3_record_prefix(pending_v3, predicted_end, consumed_end)
-                self.v3_boundary_ready(scheduler_output)
-                if v3_raw_config.get("trace_prefix_row_bytes", False) and all(
-                    size is not None for size in pending_v3.row_bytes
-                ):
-                    anchor_bytes = sum(
-                        getattr(entry, "anchor_bytes", 0) for entry in pending_v3.metadata["entries"].values()
-                    )
-                    logger.info("V3_PREFIX_BYTES anchor=%d rows=%s", anchor_bytes, pending_v3.row_bytes)
-                logger.info(
-                    "V3_PREFIX_VV predicted=%d prefix=%d consumed=%d repaired=%s regions=%d",
-                    predicted_end, requested_prefix, consumed_end, repaired, v3_snapshot.region_count,
+                limit = min(semantic_draft_count, requested_prefix)
+                accepted = greedy_matching_drafts(
+                    exact_logits, spec_decode_metadata.draft_token_ids, limit
                 )
+                repaired = requested_prefix < pending_v3.total_rows and accepted + 1 == requested_prefix
+
+                if fused_mode:
+                    # The first eight rows are authoritative VV; the approximate
+                    # suffix is DV only.  Preserve the selected committed cache
+                    # rows, restore the pre-fused snapshot, then write those rows
+                    # back so speculative DV state cannot leak into the commit.
+                    committed_gdn = snapshot_gdn_committed_state(
+                        self.compilation_config.static_forward_context, attn_metadata, accepted + 1
+                    )
+                    committed_attention = snapshot_attention_committed_state(
+                        self.compilation_config.static_forward_context, attn_metadata, accepted + 1
+                    )
+                    v3_snapshot.restore()
+                    committed_gdn.restore()
+                    committed_attention.restore()
+                    torch.npu.synchronize()
+
+                    scheduled_drafts = tuple(
+                        int(token)
+                        for token in spec_decode_metadata.draft_token_ids.detach().cpu().tolist()
+                    )
+                    early = self._v3_early_draft
+                    assert early is not None
+                    exact_bonus = int(exact_logits[V3_SEMANTIC_VERIFY_ROWS - 1].argmax().item())
+                    if (
+                        accepted == V3_SEMANTIC_VERIFY_ROWS - 1
+                        and exact_bonus == scheduled_drafts[V3_SEMANTIC_VERIFY_ROWS - 1]
+                    ):
+                        next_first_block = scheduled_drafts[V3_SEMANTIC_VERIFY_ROWS:]
+                        chain = list(next_first_block) + [early.root, *early.drafts]
+                        reused_tail = True
+                    else:
+                        # The second scheduled half is invalid after partial
+                        # acceptance.  Early drafts remain safe speculative
+                        # proposals; exact verification next round still owns commit.
+                        proposal = [early.root, *early.drafts]
+                        chain = list(early.drafts)
+                        chain = (chain + proposal * 2)[:draft_count]
+                        reused_tail = False
+                    if len(chain) != draft_count or any(token < 0 for token in chain):
+                        raise RuntimeError("invalid fused V3 next draft chain")
+                    self._v3_fused_limit = V3_SEMANTIC_VERIFY_ROWS
+                    self._v3_fused_next_drafts = torch.tensor(
+                        [chain], dtype=torch.int32, device=self.device
+                    )
+                    consumed_end = accepted + 1
+                    pending_v3.finish(consumed_end)
+                    self._v3_record_prefix(pending_v3, predicted_end, consumed_end)
+                    self.v3_boundary_ready(scheduler_output)
+                    logger.info(
+                        "V3_FUSED_VV_DV predicted=%d exact_prefix=%d consumed=%d reused_tail=%s "
+                        "next_chain=%s regions=%d committed_gdn=%d committed_attention=%d",
+                        predicted_end,
+                        requested_prefix,
+                        consumed_end,
+                        reused_tail,
+                        chain,
+                        v3_snapshot.region_count,
+                        committed_gdn.region_count,
+                        committed_attention.region_count,
+                    )
+                else:
+                    if repaired or shadow_full:
+                        if shadow_full:
+                            partial_hidden = hidden_states[:requested_prefix].clone()
+                            partial_logits = exact_logits[:requested_prefix].clone()
+                            partial_gdn = snapshot_gdn_committed_state(
+                                self.compilation_config.static_forward_context,
+                                attn_metadata,
+                                min(accepted + 1, requested_prefix),
+                            )
+                            partial_attention = snapshot_attention_committed_state(
+                                self.compilation_config.static_forward_context,
+                                attn_metadata,
+                                min(accepted + 1, requested_prefix),
+                            )
+                        v3_snapshot.restore()
+                        if shadow_full and not v3_snapshot.matches():
+                            raise RuntimeError("V3 cache pages differ after VV restore")
+                        if requested_prefix < pending_v3.total_rows:
+                            pending_v3.request(pending_v3.total_rows)
+                            self._v3_copy_boundary(intermediate_tensors, pending_v3)
+                        hidden_states = self._model_forward(
+                            num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
+                        )
+                        exact_logits = self.model.compute_logits(hidden_states[logits_indices])
+                        if shadow_full:
+                            full_hidden = hidden_states[:requested_prefix]
+                            full_logits = exact_logits[:requested_prefix]
+                            logger.info(
+                                "V3_PREFIX_SHADOW prefix=%d hidden_equal=%s logits_equal=%s gdn_prefix_equal=%s "
+                                "attention_prefix_equal=%s hidden_max=%g logits_max=%g gdn_diffs=%s attention_diffs=%s",
+                                requested_prefix,
+                                tensors_bitwise_equal(partial_hidden, full_hidden),
+                                tensors_bitwise_equal(partial_logits, full_logits),
+                                partial_gdn.matches(),
+                                partial_attention.matches(),
+                                (partial_hidden.float() - full_hidden.float()).abs().max().item(),
+                                (partial_logits.float() - full_logits.float()).abs().max().item(),
+                                partial_gdn.differences(limit=2),
+                                partial_attention.differences(limit=2),
+                            )
+                        accepted = greedy_matching_drafts(
+                            exact_logits, spec_decode_metadata.draft_token_ids, draft_count
+                        )
+                    consumed_end = accepted + 1
+                    pending_v3.finish(consumed_end)
+                    self._v3_record_prefix(pending_v3, predicted_end, consumed_end)
+                    self.v3_boundary_ready(scheduler_output)
+                    if v3_raw_config.get("trace_prefix_row_bytes", False) and all(
+                        size is not None for size in pending_v3.row_bytes
+                    ):
+                        anchor_bytes = sum(
+                            getattr(entry, "anchor_bytes", 0)
+                            for entry in pending_v3.metadata["entries"].values()
+                        )
+                        logger.info("V3_PREFIX_BYTES anchor=%d rows=%s", anchor_bytes, pending_v3.row_bytes)
+                    logger.info(
+                        "V3_PREFIX_VV predicted=%d prefix=%d consumed=%d repaired=%s regions=%d",
+                        predicted_end, requested_prefix, consumed_end, repaired, v3_snapshot.region_count,
+                    )
             # TrioSLO half-card emulation: duplicate the model body only.
             # KV slots are rewritten with identical values, while scheduler
             # state, async-sampling state, and PP handshakes remain single-shot.
@@ -2949,6 +3065,12 @@ class NPUModelRunner(GPUModelRunner):
 
         with record_function_or_nullcontext("sample_token"):
             sampler_output = self._sample(logits, spec_decode_metadata)
+            fused_limit = self._v3_fused_limit
+            fused_next_drafts = self._v3_fused_next_drafts
+            if fused_limit is not None and sampler_output.sampled_token_ids.ndim == 2:
+                if sampler_output.sampled_token_ids.shape[-1] <= fused_limit:
+                    raise RuntimeError("V3 fused sampling geometry is too short")
+                sampler_output.sampled_token_ids[:, fused_limit:] = -1
 
         if self.need_accepted_tokens:
             if self.sampling_done_event is None:
@@ -3006,21 +3128,36 @@ class NPUModelRunner(GPUModelRunner):
                     )
                     and not self.speculative_config.disable_padded_drafter_batch
                 )
-                if use_padded_batch:
-                    # EAGLE speculative decoding can use the GPU sampled tokens
-                    # as inputs, and does not need to wait for bookkeeping to finish.
-                    propose_draft_token_ids(sampler_output.sampled_token_ids)
-                if self.speculative_config and not use_padded_batch:
-                    # ngram and other speculative decoding methods use the sampled
-                    # tokens on the CPU, so they are run after bookkeeping.
-                    propose_draft_token_ids(valid_sampled_token_ids)
+                if fused_next_drafts is not None:
+                    self._draft_token_ids = fused_next_drafts
+                    self._copy_draft_token_ids_to_cpu(scheduler_output)
+                else:
+                    if use_padded_batch:
+                        # EAGLE speculative decoding can use the GPU sampled tokens
+                        # as inputs, and does not need to wait for bookkeeping to finish.
+                        propose_draft_token_ids(sampler_output.sampled_token_ids)
+                    if self.speculative_config and not use_padded_batch:
+                        # ngram and other speculative decoding methods use the sampled
+                        # tokens on the CPU, so they are run after bookkeeping.
+                        propose_draft_token_ids(valid_sampled_token_ids)
 
                 early_draft = self._v3_early_draft
                 self._v3_early_draft = None
                 if early_draft is not None and valid_sampled_token_ids and valid_sampled_token_ids[0]:
-                    exact_drafts = [int(token) for token in self._draft_token_ids[0].detach().cpu().tolist()]
-                    comparison = compare_early_draft(early_draft, valid_sampled_token_ids[0], exact_drafts)
-                    logger.info("V3_EARLY_MTP_RESULT %s", json.dumps(comparison, sort_keys=True))
+                    if fused_next_drafts is not None:
+                        logger.info(
+                            "V3_FUSED_COMMIT tokens=%d approximate_chain=%s",
+                            len(valid_sampled_token_ids[0]),
+                            [early_draft.root, *early_draft.drafts],
+                        )
+                    else:
+                        exact_drafts = [
+                            int(token) for token in self._draft_token_ids[0].detach().cpu().tolist()
+                        ]
+                        comparison = compare_early_draft(
+                            early_draft, valid_sampled_token_ids[0], exact_drafts
+                        )
+                        logger.info("V3_EARLY_MTP_RESULT %s", json.dumps(comparison, sort_keys=True))
 
             # vLLM v0.18 defers KV connector finalization during target-model
             # forward when speculative decoding is enabled. Finalize here after
