@@ -154,6 +154,7 @@ from vllm_ascend.v3.early_draft import (
     greedy_frontier,
     snapshot_draft_cache,
 )
+from vllm_ascend.v3.mtp_metadata import prefix_mtp_metadata
 from vllm_ascend.v3.runtime import (
     EventRecorder,
     NetworkAwarePrefixPolicy,
@@ -164,6 +165,7 @@ from vllm_ascend.v3.state_snapshot import (
     UnsupportedStateSnapshot,
     snapshot_attention_committed_state,
     snapshot_attention_state,
+    snapshot_attention_suffix_state,
     snapshot_gdn_committed_state,
     tensors_bitwise_equal,
 )
@@ -641,6 +643,7 @@ class NPUModelRunner(GPUModelRunner):
         self._v3_early_draft: EarlyDraft | None = None
         self._v3_fused_limit: int | None = None
         self._v3_fused_next_drafts: torch.Tensor | None = None
+        self._v3_last_snapshot_ms: float = 0.0
         self._v3_network_policy: NetworkAwarePrefixPolicy | None = None
         self._v3_row_bytes: list[int] | None = None
 
@@ -842,8 +845,43 @@ class NPUModelRunner(GPUModelRunner):
             logger.warning("V3_EARLY_MTP_SKIP unsupported proposer, metadata, or configuration")
             return None
 
+        probe_spec_decode_metadata = spec_decode_metadata
+        if (
+            draft_limit is not None
+            and len(spec_decode_metadata.draft_token_ids) > int(draft_limit)
+        ):
+            probe_spec_decode_metadata = replace(
+                spec_decode_metadata,
+                draft_token_ids=spec_decode_metadata.draft_token_ids[: int(draft_limit)],
+                num_draft_tokens=[int(draft_limit)],
+                cu_num_draft_tokens=torch.tensor(
+                    [int(draft_limit)], dtype=spec_decode_metadata.cu_num_draft_tokens.dtype,
+                    device=self.device,
+                ),
+                cu_num_sampled_tokens=torch.tensor(
+                    [int(draft_limit) + 1],
+                    dtype=spec_decode_metadata.cu_num_sampled_tokens.dtype,
+                    device=self.device,
+                ),
+            )
+        frontier_logits = (
+            logits[: int(draft_limit) + 1]
+            if probe_spec_decode_metadata is not spec_decode_metadata
+            else logits
+        )
+        probe_common_metadata = common_metadata
+        if (
+            draft_limit is not None
+            and hidden_states.shape[0] == int(draft_limit) + 1
+            and common_metadata is not None
+        ):
+            probe_common_metadata = prefix_mtp_metadata(
+                common_metadata, int(draft_limit) + 1, self.input_ids.gpu.shape[0]
+            )
         accepted, root = greedy_frontier(
-            logits, spec_decode_metadata.draft_token_ids, limit=draft_limit
+            frontier_logits,
+            probe_spec_decode_metadata.draft_token_ids,
+            limit=draft_limit,
         )
         counts = torch.tensor([accepted + 1], dtype=torch.int32, device=self.device)
         started = time.perf_counter()
@@ -859,14 +897,30 @@ class NPUModelRunner(GPUModelRunner):
         torch.npu.synchronize()
         snapshot_ms = (time.perf_counter() - started) * 1000
         draft_started = time.perf_counter()
+        original_drafter_depth = self.drafter.num_speculative_tokens
+        original_decode_threshold = self.drafter.decode_threshold
         try:
             draft_metadata, token_indices, sample_indices, rejected = self.drafter.prepare_inputs_padded(
-                common_metadata, spec_decode_metadata, counts
+                probe_common_metadata, probe_spec_decode_metadata, counts
             )
+            local_drafter_depth = int(draft_limit or original_drafter_depth)
+            self.drafter.num_speculative_tokens = local_drafter_depth
+            self.drafter.decode_threshold = local_drafter_depth + 1
             draft_ids = self.drafter._propose(
-                target_token_ids=self.input_ids.gpu[token_indices],
-                target_positions=self._get_positions(token_indices),
-                target_hidden_states=hidden_states[token_indices],
+                target_token_ids=self.input_ids.gpu[
+                    token_indices
+                    if hidden_states.shape[0] >= token_indices.shape[0]
+                    else token_indices[: hidden_states.shape[0]]
+                ],
+                target_positions=self._get_positions(
+                    token_indices if hidden_states.shape[0] >= token_indices.shape[0]
+                    else token_indices[: hidden_states.shape[0]]
+                ),
+                target_hidden_states=hidden_states[
+                    token_indices
+                    if hidden_states.shape[0] >= token_indices.shape[0]
+                    else token_indices[: hidden_states.shape[0]]
+                ],
                 next_token_ids=root,
                 token_indices_to_sample=sample_indices,
                 common_attn_metadata=draft_metadata,
@@ -886,6 +940,8 @@ class NPUModelRunner(GPUModelRunner):
             root_value = int(root.detach().cpu().item())
             draft_ms = (time.perf_counter() - draft_started) * 1000
         finally:
+            self.drafter.num_speculative_tokens = original_drafter_depth
+            self.drafter.decode_threshold = original_decode_threshold
             restore_started = time.perf_counter()
             snapshot.restore()
             torch.npu.synchronize()
@@ -2633,10 +2689,34 @@ class NPUModelRunner(GPUModelRunner):
                             getattr(metadata, "num_prefills", 0) or getattr(metadata, "num_decodes", 0)
                         ):
                             raise UnsupportedStateSnapshot("mixed prefill or non-spec decode")
-                    v3_snapshot = snapshot_attention_state(context, attn_metadata)
+                    fused_light_commit = bool(
+                        raw_v3_config.get("experimental_fused_light_commit", False)
+                    )
+                    if fused_mode and fused_light_commit:
+                        if bool(raw_v3_config.get("experimental_fused_shadow", False)):
+                            raise RuntimeError("V3 light fused commit cannot run with shadow control")
+                        v3_snapshot = None
+                        self._v3_last_snapshot_ms = 0.0
+                    else:
+                        snapshot_started = time.perf_counter()
+                        v3_snapshot = (
+                            snapshot_attention_suffix_state(
+                                context, attn_metadata, V3_SEMANTIC_VERIFY_ROWS
+                            )
+                            if fused_mode
+                            else snapshot_attention_state(context, attn_metadata)
+                        )
+                        if bool(raw_v3_config.get("trace_fused_timing", False)):
+                            torch.npu.synchronize()
+                            self._v3_last_snapshot_ms = (
+                                time.perf_counter() - snapshot_started
+                            ) * 1000
                 except (UnsupportedStateSnapshot, RuntimeError) as exc:
                     logger.warning("V3 prefix VV falls back to full residual: %s", exc)
-            if v3_snapshot is None:
+            if v3_snapshot is None and not (
+                fused_mode
+                and bool(raw_v3_config.get("experimental_fused_light_commit", False))
+            ):
                 pending_v3.request(pending_v3.total_rows)
                 self._v3_copy_boundary(intermediate_tensors, pending_v3)
                 pending_v3.finish(pending_v3.total_rows)
@@ -2690,7 +2770,10 @@ class NPUModelRunner(GPUModelRunner):
                 profile_start_event.record()
 
             if pending_v3 is not None:
-                assert v3_snapshot is not None and spec_decode_metadata is not None
+                assert spec_decode_metadata is not None
+                assert v3_snapshot is not None or bool(
+                    raw_v3_config.get("experimental_fused_light_commit", False)
+                )
                 draft_count = len(spec_decode_metadata.draft_token_ids)
                 v3_raw_config = (self.vllm_config.additional_config or {}).get("v3_verdict_adaptive", {})
                 fused_mode = (
@@ -2699,76 +2782,199 @@ class NPUModelRunner(GPUModelRunner):
                     and draft_count == V3_FUSED_VERIFY_ROWS - 1
                 )
                 semantic_draft_count = V3_SEMANTIC_VERIFY_ROWS - 1 if fused_mode else draft_count
-                approximate_hidden = self._model_forward(
-                    num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
-                )
-                approximate_logits = self.model.compute_logits(approximate_hidden[logits_indices])
-                predicted_end = greedy_matching_drafts(
-                    approximate_logits, spec_decode_metadata.draft_token_ids, semantic_draft_count
-                ) + 1
+                single_pass_fused = bool(v3_raw_config.get("experimental_fused_single_pass", False))
+                overlap_early_mtp = bool(v3_raw_config.get("experimental_dv_mtp_shadow", False))
+                predicted_end = 0
                 requested_prefix = (
                     V3_SEMANTIC_VERIFY_ROWS
                     if fused_mode
                     else self._v3_choose_prefix(pending_v3, predicted_end)
                 )
-                overlap_early_mtp = bool(v3_raw_config.get("experimental_dv_mtp_shadow", False))
-                if overlap_early_mtp:
-                    pending_v3.start_request(requested_prefix)
-                self._v3_early_draft = self._v3_probe_early_mtp(
-                    approximate_logits,
-                    approximate_hidden,
-                    spec_decode_metadata,
-                    spec_decode_common_attn_metadata,
-                    scheduler_output,
-                    batch_desc,
-                    draft_limit=semantic_draft_count if fused_mode else None,
-                )
-                if fused_mode and self._v3_early_draft is None:
-                    raise RuntimeError("V3 fused VV+DV requires a provisional MTP chain")
-                if self._v3_early_draft is not None:
-                    pending_v3.send_provisional_draft(
-                        self._v3_early_draft.accepted_drafts,
-                        self._v3_early_draft.root,
-                        self._v3_early_draft.drafts,
+                if fused_mode and single_pass_fused:
+                    # One target traversal per scheduler step.  The exact seed for
+                    # the next chain is produced from the fused first half after VV;
+                    # no separate approximate target forward is executed.
+                    self._v3_early_draft = None
+                    if overlap_early_mtp:
+                        pending_v3.start_request(requested_prefix)
+                else:
+                    approximate_hidden = self._model_forward(
+                        num_tokens_padded, input_ids, positions, intermediate_tensors,
+                        inputs_embeds, **model_kwargs,
                     )
-                    logger.info("V3_EARLY_MTP_READY after_request=true before_residual_decode=true")
-                v3_snapshot.restore()
+                    approximate_logits = self.model.compute_logits(
+                        approximate_hidden[logits_indices]
+                    )
+                    predicted_end = greedy_matching_drafts(
+                        approximate_logits,
+                        spec_decode_metadata.draft_token_ids,
+                        semantic_draft_count,
+                    ) + 1
+                    requested_prefix = (
+                        V3_SEMANTIC_VERIFY_ROWS
+                        if fused_mode
+                        else self._v3_choose_prefix(pending_v3, predicted_end)
+                    )
+                    if overlap_early_mtp:
+                        pending_v3.start_request(requested_prefix)
+                    self._v3_early_draft = self._v3_probe_early_mtp(
+                        approximate_logits,
+                        approximate_hidden,
+                        spec_decode_metadata,
+                        spec_decode_common_attn_metadata,
+                        scheduler_output,
+                        batch_desc,
+                        draft_limit=semantic_draft_count if fused_mode else None,
+                    )
+                    if fused_mode and self._v3_early_draft is None:
+                        raise RuntimeError("V3 fused VV+DV requires a provisional MTP chain")
+                    if self._v3_early_draft is not None:
+                        pending_v3.send_provisional_draft(
+                            self._v3_early_draft.accepted_drafts,
+                            self._v3_early_draft.root,
+                            self._v3_early_draft.drafts,
+                        )
+                        logger.info("V3_EARLY_MTP_READY after_request=true before_residual_decode=true")
+                if v3_snapshot is not None:
+                    v3_snapshot.restore()
                 shadow_full = bool(v3_raw_config.get("prefix_shadow_full", False))
-                if shadow_full and not v3_snapshot.matches():
+                if shadow_full and v3_snapshot is not None and not v3_snapshot.matches():
                     raise RuntimeError("V3 cache pages differ after DV restore")
+                residual_started = time.perf_counter()
                 if overlap_early_mtp:
                     pending_v3.complete_request(keep_approximate_suffix=fused_mode)
                 else:
                     pending_v3.request(requested_prefix)
+                residual_ms = (time.perf_counter() - residual_started) * 1000
                 self._v3_copy_boundary(intermediate_tensors, pending_v3)
 
+            fused_started = time.perf_counter()
             hidden_states = self._model_forward(
                 num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
             )
             if pending_v3 is not None:
-                assert v3_snapshot is not None and spec_decode_metadata is not None
+                assert spec_decode_metadata is not None
+                assert v3_snapshot is not None or bool(
+                    v3_raw_config.get("experimental_fused_light_commit", False)
+                )
                 exact_logits = self.model.compute_logits(hidden_states[logits_indices])
+                if fused_mode and bool(v3_raw_config.get("trace_fused_timing", False)):
+                    torch.npu.synchronize()
+                fused_ms = (time.perf_counter() - fused_started) * 1000
                 limit = min(semantic_draft_count, requested_prefix)
                 accepted = greedy_matching_drafts(
                     exact_logits, spec_decode_metadata.draft_token_ids, limit
                 )
                 repaired = requested_prefix < pending_v3.total_rows and accepted + 1 == requested_prefix
 
+                if fused_mode and single_pass_fused:
+                    self._v3_early_draft = self._v3_probe_early_mtp(
+                        exact_logits,
+                        hidden_states,
+                        spec_decode_metadata,
+                        spec_decode_common_attn_metadata,
+                        scheduler_output,
+                        batch_desc,
+                        draft_limit=semantic_draft_count,
+                    )
+                    if self._v3_early_draft is None:
+                        raise RuntimeError("V3 single-pass fused VV+DV requires an exact MTP seed")
+                    predicted_end = accepted + 1
+
                 if fused_mode:
                     # The first eight rows are authoritative VV; the approximate
                     # suffix is DV only.  Preserve the selected committed cache
                     # rows, restore the pre-fused snapshot, then write those rows
                     # back so speculative DV state cannot leak into the commit.
-                    committed_gdn = snapshot_gdn_committed_state(
-                        self.compilation_config.static_forward_context, attn_metadata, accepted + 1
+                    fused_light_commit = bool(
+                        v3_raw_config.get("experimental_fused_light_commit", False)
                     )
-                    committed_attention = snapshot_attention_committed_state(
-                        self.compilation_config.static_forward_context, attn_metadata, accepted + 1
-                    )
-                    v3_snapshot.restore()
-                    committed_gdn.restore()
-                    committed_attention.restore()
-                    torch.npu.synchronize()
+                    committed_gdn = None
+                    committed_attention = None
+                    if fused_light_commit:
+                        # Rejected fused suffix is unreachable after rejection and
+                        # vLLM's hybrid postprocessor selects the committed prefix.
+                        commit_started = time.perf_counter()
+                        commit_ms = (time.perf_counter() - commit_started) * 1000
+                    else:
+                        commit_started = time.perf_counter()
+                        committed_gdn = snapshot_gdn_committed_state(
+                            self.compilation_config.static_forward_context,
+                            attn_metadata,
+                            accepted + 1,
+                        )
+                        fused_shadow = bool(v3_raw_config.get("experimental_fused_shadow", False))
+                        committed_attention = (
+                            snapshot_attention_committed_state(
+                                self.compilation_config.static_forward_context,
+                                attn_metadata,
+                                accepted + 1,
+                            )
+                            if fused_shadow
+                            else None
+                        )
+                        if fused_shadow:
+                            pending_v3.start_request(pending_v3.total_rows)
+                            pending_v3.complete_request()
+                            self._v3_copy_boundary(intermediate_tensors, pending_v3)
+                            v3_snapshot.restore()
+                            control_hidden_states = self._model_forward(
+                                num_tokens_padded, input_ids, positions, intermediate_tensors,
+                                inputs_embeds, **model_kwargs,
+                            )
+                            control_logits = self.model.compute_logits(
+                                control_hidden_states[logits_indices]
+                            )
+                            control_accepted = greedy_matching_drafts(
+                                control_logits, spec_decode_metadata.draft_token_ids, limit
+                            )
+                            control_gdn = snapshot_gdn_committed_state(
+                                self.compilation_config.static_forward_context,
+                                attn_metadata,
+                                control_accepted + 1,
+                            )
+                            control_attention = snapshot_attention_committed_state(
+                                self.compilation_config.static_forward_context,
+                                attn_metadata,
+                                control_accepted + 1,
+                            )
+                            hidden_equal = tensors_bitwise_equal(
+                                hidden_states[:V3_SEMANTIC_VERIFY_ROWS],
+                                control_hidden_states[:V3_SEMANTIC_VERIFY_ROWS],
+                            )
+                            logits_equal = tensors_bitwise_equal(
+                                exact_logits[:V3_SEMANTIC_VERIFY_ROWS],
+                                control_logits[:V3_SEMANTIC_VERIFY_ROWS],
+                            )
+                            gdn_equal = committed_gdn.matches()
+                            attention_equal = committed_attention.matches()
+                            accepted_equal = accepted == control_accepted
+                            logger.info(
+                                "V3_FUSED_SHADOW accepted_equal=%s hidden_equal=%s logits_equal=%s "
+                                "gdn_equal=%s attention_equal=%s candidate=%d control=%d",
+                                accepted_equal, hidden_equal, logits_equal, gdn_equal,
+                                attention_equal, accepted, control_accepted,
+                            )
+                            if not all((
+                                accepted_equal, hidden_equal, logits_equal,
+                                gdn_equal, attention_equal,
+                            )):
+                                raise RuntimeError("V3 fused BF16 shadow control failed")
+                            v3_snapshot.restore()
+                            control_gdn.restore()
+                            control_attention.restore()
+                            torch.npu.synchronize()
+                            hidden_states = control_hidden_states
+                            exact_logits = control_logits
+                            committed_gdn = control_gdn
+                            committed_attention = control_attention
+                        else:
+                            v3_snapshot.restore()
+                            committed_gdn.restore()
+                            if committed_attention is not None:
+                                committed_attention.restore()
+                            torch.npu.synchronize()
+                        commit_ms = (time.perf_counter() - commit_started) * 1000
 
                     scheduled_drafts = tuple(
                         int(token)
@@ -2777,7 +2983,11 @@ class NPUModelRunner(GPUModelRunner):
                     early = self._v3_early_draft
                     assert early is not None
                     exact_bonus = int(exact_logits[V3_SEMANTIC_VERIFY_ROWS - 1].argmax().item())
-                    if (
+                    if single_pass_fused:
+                        proposal = [early.root, *early.drafts]
+                        chain = [*early.drafts, *proposal]
+                        reused_tail = False
+                    elif (
                         accepted == V3_SEMANTIC_VERIFY_ROWS - 1
                         and exact_bonus == scheduled_drafts[V3_SEMANTIC_VERIFY_ROWS - 1]
                     ):
@@ -2804,15 +3014,21 @@ class NPUModelRunner(GPUModelRunner):
                     self.v3_boundary_ready(scheduler_output)
                     logger.info(
                         "V3_FUSED_VV_DV predicted=%d exact_prefix=%d consumed=%d reused_tail=%s "
-                        "next_chain=%s regions=%d committed_gdn=%d committed_attention=%d",
+                        "next_chain=%s regions=%d committed_gdn=%d committed_attention=%d "
+                        "snapshot_ms=%.3f residual_ms=%.3f fused_ms=%.3f mtp_ms=%.3f commit_ms=%.3f",
                         predicted_end,
                         requested_prefix,
                         consumed_end,
                         reused_tail,
                         chain,
-                        v3_snapshot.region_count,
-                        committed_gdn.region_count,
-                        committed_attention.region_count,
+                        v3_snapshot.region_count if v3_snapshot is not None else 0,
+                        committed_gdn.region_count if committed_gdn is not None else 0,
+                        committed_attention.region_count if committed_attention is not None else 0,
+                        self._v3_last_snapshot_ms,
+                        residual_ms,
+                        fused_ms,
+                        early.draft_ms,
+                        commit_ms,
                     )
                 else:
                     if repaired or shadow_full:

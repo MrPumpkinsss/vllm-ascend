@@ -537,6 +537,9 @@ def test_additional_config_is_spawn_safe():
                 "prefix_length": 6,
                 "experimental_dv_mtp_shadow": True,
                 "experimental_fused_vv_dv": True,
+                "experimental_fused_shadow": True,
+                "experimental_fused_single_pass": True,
+                "experimental_fused_light_commit": True,
             }
         }
     )
@@ -546,6 +549,9 @@ def test_additional_config_is_spawn_safe():
     assert config.prefix_length == 6
     assert config.provisional_feedback
     assert config.fused_vv_dv
+    assert config.fused_shadow
+    assert config.fused_single_pass
+    assert config.fused_light_commit
     assert not V3TransportConfig.from_vllm_config({}).provisional_feedback
     assert not V3TransportConfig.from_vllm_config({}).fused_vv_dv
 

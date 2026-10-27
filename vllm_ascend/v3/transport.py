@@ -46,6 +46,9 @@ class V3TransportConfig:
     engine_prefix_vv: bool = False
     provisional_feedback: bool = False
     fused_vv_dv: bool = False
+    fused_shadow: bool = False
+    fused_single_pass: bool = False
+    fused_light_commit: bool = False
 
     @classmethod
     def from_env(cls) -> V3TransportConfig:
@@ -83,6 +86,9 @@ class V3TransportConfig:
         config.engine_prefix_vv = bool(raw.get("engine_prefix_vv", config.engine_prefix_vv))
         config.provisional_feedback = bool(raw.get("experimental_dv_mtp_shadow", False))
         config.fused_vv_dv = bool(raw.get("experimental_fused_vv_dv", False))
+        config.fused_shadow = bool(raw.get("experimental_fused_shadow", False))
+        config.fused_single_pass = bool(raw.get("experimental_fused_single_pass", False))
+        config.fused_light_commit = bool(raw.get("experimental_fused_light_commit", False))
         if config.codec not in {"nvfp4", "raw"}:
             raise ValueError(f"unsupported V3 codec {config.codec}")
         return config

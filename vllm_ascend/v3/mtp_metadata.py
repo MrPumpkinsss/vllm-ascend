@@ -35,3 +35,59 @@ def accepted_draft_metadata(metadata: Any, rejected: torch.Tensor, batch_size: i
         corrected[:batch_size] -= rejected_cpu.to(device=value.device, dtype=value.dtype)
         setattr(result, name, corrected)
     return result
+
+
+def prefix_mtp_metadata(metadata: Any, prefix_rows: int, total_rows: int) -> Any:
+    """Return a one-request K/2 metadata view for an outer fused 2K batch."""
+    if prefix_rows < 2 or prefix_rows >= total_rows:
+        raise ValueError("prefix rows must be a proper fused prefix")
+    query = getattr(metadata, "query_start_loc", None)
+    query_cpu = getattr(metadata, "query_start_loc_cpu", None)
+    seq_lens = getattr(metadata, "seq_lens", None)
+    if (
+        not isinstance(query, torch.Tensor)
+        or not isinstance(query_cpu, torch.Tensor)
+        or not isinstance(seq_lens, torch.Tensor)
+        or query_cpu.numel() < 2
+        or seq_lens.ndim != 1
+        or seq_lens.numel() < 1
+    ):
+        raise ValueError("missing one-request speculative attention metadata")
+    result = copy.copy(metadata)
+    device = query.device
+    result.query_start_loc = torch.tensor(
+        [0, prefix_rows], dtype=query.dtype, device=device
+    )
+    result.query_start_loc_cpu = torch.tensor(
+        [0, prefix_rows], dtype=query_cpu.dtype, device=query_cpu.device
+    )
+    rejected = total_rows - prefix_rows
+    result.seq_lens = seq_lens.clone()
+    result.seq_lens[:1] -= rejected
+    for name in ("seq_lens_cpu", "_seq_lens_cpu", "seq_lens_cpu_upper_bound"):
+        value = getattr(metadata, name, None)
+        if isinstance(value, torch.Tensor) and value.ndim == 1 and value.numel():
+            copied = value.clone()
+            copied[:1] -= rejected
+            setattr(result, name, copied)
+    slot_mapping = getattr(metadata, "slot_mapping", None)
+    if isinstance(slot_mapping, torch.Tensor) and slot_mapping.numel() >= total_rows:
+        result.slot_mapping = slot_mapping.reshape(-1)[:prefix_rows]
+    state_indices = getattr(metadata, "spec_state_indices_tensor", None)
+    if isinstance(state_indices, torch.Tensor) and state_indices.ndim == 2:
+        result.spec_state_indices_tensor = state_indices[:, :prefix_rows]
+    positions = getattr(metadata, "positions", None)
+    if isinstance(positions, torch.Tensor) and positions.numel() >= total_rows:
+        result.positions = positions.reshape(-1)[:prefix_rows]
+    positions_cpu = getattr(metadata, "positions_cpu", None)
+    if isinstance(positions_cpu, torch.Tensor) and positions_cpu.numel() >= total_rows:
+        result.positions_cpu = positions_cpu.reshape(-1)[:prefix_rows]
+    result.num_reqs = 1
+    result.num_actual_tokens = prefix_rows
+    result.num_input_tokens = prefix_rows
+    result.max_query_len = prefix_rows
+    result.decode_token_per_req = prefix_rows
+    result.actual_seq_lengths_q = list(
+        getattr(metadata, "actual_seq_lengths_q", [])[:prefix_rows]
+    )
+    return result

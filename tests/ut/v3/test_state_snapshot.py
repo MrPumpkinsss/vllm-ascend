@@ -7,6 +7,7 @@ from vllm_ascend.v3.state_snapshot import (
     UnsupportedStateSnapshot,
     snapshot_attention_committed_state,
     snapshot_attention_state,
+    snapshot_attention_suffix_state,
     snapshot_gdn_committed_state,
     snapshot_gdn_prefix,
     tensors_bitwise_equal,
@@ -106,3 +107,27 @@ def test_bitwise_tensor_comparison_distinguishes_signed_zero_and_nan():
     equal[0] = -0.0
     assert not tensors_bitwise_equal(original, equal)
     assert not tensors_bitwise_equal(original, original.float())
+
+
+def test_suffix_snapshot_restores_only_paged_suffix_slots():
+    key = torch.arange(8, dtype=torch.float32).reshape(2, 2, 2).clone()
+    value = key + 100
+    context = {"page": SimpleNamespace(kv_cache=(key, value))}
+    metadata = {"page": SimpleNamespace(slot_mapping=torch.tensor([0, 1, 2, 3]))}
+    snapshot = snapshot_attention_suffix_state(context, metadata, suffix_start=2)
+    original_key, original_value = key.clone(), value.clone()
+    key[1, 1] = -1000
+    value[1, 1] = -2000
+    snapshot.restore()
+    assert torch.equal(key, original_key)
+    assert torch.equal(value, original_value)
+
+
+def test_gdn_state_is_snapshotted_whole_for_fused_suffix():
+    recurrent = torch.tensor([[1.0], [2.0]])
+    context = {"gdn": SimpleNamespace(kv_cache=(torch.zeros(2, 1, 1), recurrent))}
+    metadata = {"gdn": SimpleNamespace(spec_state_indices_tensor=torch.tensor([[0, 1]]))}
+    snapshot = snapshot_attention_suffix_state(context, metadata, suffix_start=1)
+    recurrent[:] = -1
+    snapshot.restore()
+    assert torch.equal(recurrent, torch.tensor([[1.0], [2.0]]))

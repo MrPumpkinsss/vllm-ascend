@@ -196,3 +196,45 @@ def snapshot_attention_committed_state(
                 regions.append((tensor[page], offsets[pages == page]))
                 labels.append(f"{layer_name}:{index}:page[{page}]")
     return IndexedStateSnapshot(regions, labels)
+
+
+def snapshot_attention_suffix_state(
+    forward_context: dict[str, Any], attn_metadata: dict[str, Any], suffix_start: int
+) -> IndexedStateSnapshot:
+    """Snapshot GDN state plus only paged-attention slots written by a fused suffix."""
+    if suffix_start < 1:
+        raise UnsupportedStateSnapshot("a fused suffix must start after the committed prefix")
+    regions: list[tuple[torch.Tensor, torch.Tensor]] = []
+    for layer_name, metadata in attn_metadata.items():
+        layer = forward_context.get(layer_name)
+        if layer is None or not hasattr(layer, "kv_cache"):
+            continue
+        cache = layer.kv_cache
+        if not isinstance(cache, (list, tuple)) or not cache:
+            raise UnsupportedStateSnapshot(f"unsupported cache layout for {layer_name}")
+        if not all(isinstance(tensor, torch.Tensor) and tensor.ndim >= 2 for tensor in cache):
+            raise UnsupportedStateSnapshot(f"unsupported cache tensors for {layer_name}")
+        state_indices = getattr(metadata, "spec_state_indices_tensor", None)
+        if state_indices is not None:
+            indices = state_indices.reshape(-1)
+            regions.extend((tensor, indices) for tensor in cache)
+            continue
+        slot_mapping = getattr(metadata, "slot_mapping", None)
+        if not isinstance(slot_mapping, torch.Tensor):
+            raise UnsupportedStateSnapshot(f"missing writable-slot metadata for {layer_name}")
+        slots = slot_mapping.reshape(-1).detach().to(device="cpu", dtype=torch.long)
+        if slots.numel() < suffix_start or (slots[suffix_start:] < 0).any():
+            raise UnsupportedStateSnapshot(f"invalid fused suffix slots for {layer_name}")
+        suffix_slots = slots[suffix_start:]
+        block_size = cache[0].shape[1]
+        if block_size <= 0 or any(tensor.shape[1] != block_size for tensor in cache):
+            raise UnsupportedStateSnapshot(f"unsupported paged-cache layout for {layer_name}")
+        pages = suffix_slots // block_size
+        offsets = suffix_slots % block_size
+        for page in torch.unique(pages).tolist():
+            if page >= cache[0].shape[0]:
+                raise UnsupportedStateSnapshot(f"attention page is out of bounds for {layer_name}")
+            selected_offsets = offsets[pages == page].to(device=cache[0].device)
+            for tensor in cache:
+                regions.append((tensor[page], selected_offsets))
+    return IndexedStateSnapshot(regions)
