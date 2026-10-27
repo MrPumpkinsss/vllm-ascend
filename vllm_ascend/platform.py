@@ -440,14 +440,25 @@ class NPUPlatform(Platform):
         if kv_transfer_config is not None and getattr(kv_transfer_config, "kv_role", None) == "kv_producer":
             return
 
+        additional = getattr(vllm_config, "additional_config", None) or {}
+        v3 = additional.get("v3_verdict_adaptive", {}) if isinstance(additional, dict) else {}
+        v3_enabled = bool(v3.get("enabled", False)) if isinstance(v3, dict) else False
         if (
-            os.environ.get("VLLM_ASCEND_V2_SEMANTIC_PP", "0") == "1"
+            (
+                os.environ.get("VLLM_ASCEND_V2_SEMANTIC_PP", "0") == "1"
+                or os.environ.get("VLLM_ASCEND_V3_VERDICT_ADAPTIVE", "0") == "1"
+                or v3_enabled
+            )
             and parallel_config.pipeline_parallel_size == 2
         ):
             logger.warning(
-                "Allowing experimental V2 PP=2 semantic-boundary MTP; this is "
+                "Allowing experimental V2/V3 PP=2 semantic-boundary MTP; this is "
                 "not covered by upstream PD-disaggregated PP+MTP validation."
             )
+            if v3_enabled:
+                # Correctness-first V3 mode does not allow the PP batch queue to
+                # schedule ahead before MTP draft ids are available.
+                vllm_config.scheduler_config.async_scheduling = False
             return
 
         raise ValueError(

@@ -56,6 +56,7 @@ from vllm.v1.worker.workspace import init_workspace_manager
 
 import vllm_ascend.envs as envs_ascend
 from vllm_ascend.v2.tcp_transport import SemanticPPTransport
+from vllm_ascend.v3.transport import V3TransportConfig, VerdictAdaptiveTransport
 from vllm_ascend.ascend_config import get_ascend_config, init_ascend_config
 from vllm_ascend.batch_invariant import init_batch_invariance
 from vllm_ascend.cpu_binding import bind_cpus
@@ -167,12 +168,13 @@ class NPUWorker(WorkerBase):
         # Experimental V2 split-computing path. PP2 replaces HCCL at the single
         # intermediate-tensor boundary with semantic anchor + exact residual.
         self.v2_semantic_pp: SemanticPPTransport | None = None
-        if (
-            self.vllm_config.parallel_config.pipeline_parallel_size != 2
-            and "VLLM_ASCEND_V2_SEMANTIC_PP" in os.environ
+        self.v3_transport: VerdictAdaptiveTransport | None = None
+        v3_config = V3TransportConfig.from_env()
+        if self.vllm_config.parallel_config.pipeline_parallel_size != 2 and (
+            "VLLM_ASCEND_V2_SEMANTIC_PP" in os.environ or v3_config.enabled
         ):
             logger.warning(
-                "V2 semantic PP transport currently supports only PP=2; using native HCCL."
+                "V2/V3 semantic PP transport currently supports only PP=2; using native HCCL."
             )
 
         ascend_compilation_config = get_ascend_config().ascend_compilation_config
@@ -637,7 +639,10 @@ class NPUWorker(WorkerBase):
         intermediate_tensors = None
         forward_pass = scheduler_output.total_num_scheduled_tokens > 0
         if forward_pass and not get_pp_group().is_first_rank:
-            if self.v2_semantic_pp is not None:
+            if self.v3_transport is not None:
+                tensor_dict = self.v3_transport.recv_tensor_dict()
+                comm_handles, comm_postprocess = [], []
+            elif self.v2_semantic_pp is not None:
                 tensor_dict = self.v2_semantic_pp.recv_tensor_dict()
                 comm_handles, comm_postprocess = [], []
             else:
@@ -673,7 +678,13 @@ class NPUWorker(WorkerBase):
             all_gather_group = None
         else:
             all_gather_group = get_tp_group()
-        if self.v2_semantic_pp is not None:
+        if self.v3_transport is not None:
+            self.v3_transport.send_tensor_dict(output.tensors)
+            self._pp_send_work = []
+            stats = self.v3_transport.stats()
+            if stats["boundaries"] % 10 == 1:
+                logger.info("V3 verdict-adaptive PP boundary stats: %s", stats)
+        elif self.v2_semantic_pp is not None:
             self.v2_semantic_pp.send_tensor_dict(output.tensors)
             self._pp_send_work = []
             stats = self.v2_semantic_pp.stats()
@@ -1025,9 +1036,18 @@ class NPUWorker(WorkerBase):
         ensure_ec_transfer_initialized(self.vllm_config)
 
         if self.vllm_config.parallel_config.pipeline_parallel_size == 2:
-            self.v2_semantic_pp = SemanticPPTransport.from_env(
-                sender=get_pp_group().is_first_rank
+            v3_config = V3TransportConfig.from_vllm_config(self.vllm_config.additional_config)
+            # Stock vLLM has no VV verdict callback at this layer yet.  Always
+            # request the full independent residual so committed outputs remain
+            # exact; Prefix-Repair stays a transport-level tested protocol.
+            v3_config.adaptive = False
+            self.v3_transport = VerdictAdaptiveTransport.from_config(
+                v3_config, sender=get_pp_group().is_first_rank
             )
+            if self.v3_transport is None:
+                self.v2_semantic_pp = SemanticPPTransport.from_env(
+                    sender=get_pp_group().is_first_rank
+                )
 
     def get_supported_pooling_tasks(self):
         return self.model_runner.get_supported_pooling_tasks()

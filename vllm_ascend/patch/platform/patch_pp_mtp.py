@@ -73,12 +73,47 @@ def _patch_model_config_validation() -> None:
     ModelConfig.verify_with_parallel_config = _patched_verify_with_parallel_config
 
 
+
+def _patch_max_concurrent_batches() -> None:
+    """Serialize PP+MTP scheduler batches for V3 correctness.
+
+    Upstream PP uses a batch queue of depth PP.  With a local MTP proposer,
+    EngineCore can schedule the next batch before the previous draft token ids
+    have returned from the last pipeline stage.  Stage A then embeds -1
+    placeholders and corrupts target state.  The V3 bridge intentionally runs
+    one scheduler batch at a time until upstream owns this synchronization.
+    """
+    from vllm.config import VllmConfig
+
+    original = VllmConfig.max_concurrent_batches
+    if getattr(original, "_v3_pp_mtp_patched", False):
+        return
+
+    def patched(self):
+        parallel = getattr(self.parallel_config, "pipeline_parallel_size", 1)
+        speculative = getattr(self, "speculative_config", None)
+        method = str(getattr(speculative, "method", "") or "").lower()
+        additional = getattr(self, "additional_config", None) or {}
+        v3 = additional.get("v3_verdict_adaptive", {}) if isinstance(additional, dict) else {}
+        serialized = (
+            isinstance(v3, dict)
+            and bool(v3.get("enabled", False))
+            and bool(v3.get("serialize_spec", True))
+        )
+        if serialized and parallel > 1 and "mtp" in method:
+            return 1
+        return original.fget(self)
+
+    patched._v3_pp_mtp_patched = True  # type: ignore[attr-defined]
+    VllmConfig.max_concurrent_batches = property(patched)
+
 def _apply_patch() -> None:
     global _PATCHED
     if _PATCHED:
         return
     _PATCHED = True
     _patch_model_config_validation()
+    _patch_max_concurrent_batches()
 
 
 _apply_patch()
