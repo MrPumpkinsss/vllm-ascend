@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+# ruff: noqa: E402
+
 """Length-prefixed, CRC-checked control frames for V3 split inference."""
 
 import pickle

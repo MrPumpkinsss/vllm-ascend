@@ -20,6 +20,7 @@
 import copy
 import gc
 import logging
+import os
 from types import NoneType
 
 import torch
@@ -55,8 +56,6 @@ from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
 from vllm.v1.worker.workspace import init_workspace_manager
 
 import vllm_ascend.envs as envs_ascend
-from vllm_ascend.v2.tcp_transport import SemanticPPTransport
-from vllm_ascend.v3.transport import V3TransportConfig, VerdictAdaptiveTransport
 from vllm_ascend.ascend_config import get_ascend_config, init_ascend_config
 from vllm_ascend.batch_invariant import init_batch_invariance
 from vllm_ascend.cpu_binding import bind_cpus
@@ -74,6 +73,9 @@ from vllm_ascend.utils import (
     setup_ascend_local_comm_res,
     vllm_version_is,
 )
+from vllm_ascend.v2.tcp_transport import SemanticPPTransport
+from vllm_ascend.v3.runtime import EventRecorder
+from vllm_ascend.v3.transport import V3TransportConfig, VerdictAdaptiveTransport
 from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
 
 torch._dynamo.trace_rules.clear_lru_cache()  # noqa: E402
@@ -533,6 +535,12 @@ class NPUWorker(WorkerBase):
         else:
             self.model_runner = NPUModelRunner(self.vllm_config, self.device)
 
+        trace_path = getattr(self, "_v3_runtime_trace", "")
+        if trace_path:
+            recorder = EventRecorder(f"{trace_path}.pp{get_pp_group().rank_in_group}")
+            if hasattr(self.model_runner, "v3_enable_runtime"):
+                self.model_runner.v3_enable_runtime(recorder)
+
         if self.rank == 0:
             # If usage stat is enabled, collect relevant info.
             report_usage_stats(self.vllm_config)
@@ -641,6 +649,8 @@ class NPUWorker(WorkerBase):
         if forward_pass and not get_pp_group().is_first_rank:
             if self.v3_transport is not None:
                 tensor_dict = self.v3_transport.recv_tensor_dict()
+                if hasattr(self.model_runner, "v3_boundary_ready"):
+                    self.model_runner.v3_boundary_ready()
                 comm_handles, comm_postprocess = [], []
             elif self.v2_semantic_pp is not None:
                 tensor_dict = self.v2_semantic_pp.recv_tensor_dict()
@@ -1044,7 +1054,9 @@ class NPUWorker(WorkerBase):
             self.v3_transport = VerdictAdaptiveTransport.from_config(
                 v3_config, sender=get_pp_group().is_first_rank
             )
-            if self.v3_transport is None:
+            if self.v3_transport is not None:
+                self._v3_runtime_trace = v3_config.runtime_trace
+            else:
                 self.v2_semantic_pp = SemanticPPTransport.from_env(
                     sender=get_pp_group().is_first_rank
                 )

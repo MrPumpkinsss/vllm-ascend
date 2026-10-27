@@ -143,6 +143,11 @@ from vllm_ascend.spec_decode import get_spec_decode_method
 from vllm_ascend.spec_decode.dflash_proposer import AscendDflashProposer
 from vllm_ascend.spec_decode.draft_proposer import AscendDraftModelProposer
 from vllm_ascend.spec_decode.eagle_proposer import AscendEagleProposer
+from vllm_ascend.v3.runtime import (
+    EventRecorder,
+    SingleOwnerTransactionalState,
+    TrajectoryKey,
+)
 from vllm_ascend.spec_decode.extract_hidden_states_proposer import (
     AscendExtractHiddenStatesProposer,
 )
@@ -606,6 +611,11 @@ class NPUModelRunner(GPUModelRunner):
         self.mamba_state_idx: dict[str, int] = {}
         self._mamba_bufs: Any | None = None
         self._mamba_copy_bufs: Any | None = None
+        # V3 exact-boundary SOTS ledger.  It records commit metadata only and
+        # never owns hidden/KV/recurrent tensors.
+        self._v3_sots: SingleOwnerTransactionalState | None = None
+        self._v3_trajectory: TrajectoryKey | None = None
+        self._v3_recorder: EventRecorder | None = None
 
         # Profile-only model-body timing.  Each PP rank owns a separate file;
         # profile_real.py pairs records by sequence/composition and takes the
@@ -770,6 +780,45 @@ class NPUModelRunner(GPUModelRunner):
                     req_state.prev_num_draft_len = 0
 
         return super()._update_states(scheduler_output)
+
+    def v3_enable_runtime(self, recorder: EventRecorder | None) -> None:
+        self._v3_recorder = recorder
+        self._v3_sots = SingleOwnerTransactionalState(recorder)
+
+    def v3_boundary_ready(self, codec_id: str = "nvfp4-v1") -> None:
+        if self._v3_sots is None:
+            return
+        composition = ",".join(self.input_batch.req_ids[: self.input_batch.num_reqs])
+        fused = "separate"
+        self._v3_trajectory = TrajectoryKey(
+            model_version=self.model_config.model,
+            cut_point=int(get_pp_group().rank_in_group),
+            dtype=str(self.dtype).removeprefix("torch."),
+            k=1 + int(self.num_spec_tokens or 0),
+            batch_composition=composition,
+            fused_or_separate=fused,
+            kernel_id=str(self.compilation_config.cudagraph_mode),
+            execution_mode="vllm-v1",
+            activation_codec_id=codec_id,
+        )
+        epoch = self._v3_sots.begin(self._v3_trajectory)
+        self._v3_sots.exact_ready(epoch)
+
+    def v3_record_commit(self, valid_sampled_token_ids: list[list[int]]) -> None:
+        if self._v3_sots is None or self._v3_sots.current is None:
+            return
+        tokens = next((row for row in valid_sampled_token_ids if row), None)
+        if tokens is None:
+            self._v3_sots.flush("no_valid_tokens")
+            return
+        accepted = max(0, len(tokens) - 1)
+        self._v3_sots.commit(
+            self._v3_sots.current.epoch,
+            accepted_drafts=accepted,
+            committed_tokens=tokens,
+            next_root=tokens[-1],
+            consumed_end=min(accepted + 1, 1 + int(self.num_spec_tokens or 0)),
+        )
 
     def _update_states_after_model_execute(
         self, output_token_ids: torch.Tensor, scheduler_output: "SchedulerOutput"
@@ -2628,6 +2677,8 @@ class NPUModelRunner(GPUModelRunner):
             scheduler_output.total_num_scheduled_tokens,
             spec_decode_metadata,
         )
+        if self._v3_sots is not None:
+            self.v3_record_commit(valid_sampled_token_ids)
 
         with record_function_or_nullcontext("draft_token"):
             if self.speculative_config:

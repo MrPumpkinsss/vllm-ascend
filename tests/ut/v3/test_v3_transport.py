@@ -1,19 +1,25 @@
 from __future__ import annotations
 
+import os
 import socket
 import tempfile
 import threading
 from pathlib import Path
 
-import numpy as np
 import torch
 
 from vllm_ascend.v3.nvfp4_codec import NVFP4CodecConfig, NVFP4ExactCodec
-from vllm_ascend.v3.protocol import FrameProtocolError, recv_frame, send_frame
+from vllm_ascend.v3.protocol import recv_frame, send_frame
 from vllm_ascend.v3.transport import V3TransportConfig, VerdictAdaptiveTransport
 
 
 def _codec(directory: Path) -> NVFP4ExactCodec:
+    # ctypes keeps loaded Windows DLLs mapped; keep the shared library outside
+    # pytest's temporary directory so directory cleanup remains deterministic.
+    os.environ.setdefault(
+        "VLLM_ASCEND_V3_CODEC_CACHE",
+        str(Path(tempfile.gettempdir()) / "vllm-ascend-v3-test-codec"),
+    )
     generator = torch.Generator().manual_seed(17)
     calibration = torch.randn((8, 32), generator=generator, dtype=torch.float32).to(torch.bfloat16)
     codec = NVFP4ExactCodec(NVFP4CodecConfig(hidden_size=32))
@@ -56,12 +62,24 @@ def test_transport_full_and_prefix_repair(tmp_path):
         port = probe.getsockname()[1]
     endpoint = f"127.0.0.1:{port}"
     receiver = VerdictAdaptiveTransport(
-        "127.0.0.1", port, endpoint.split(":")[0], port, sender=False,
-        calibration_path=str(tmp_path / "tables.npz"), adaptive=True, default_prefix_length=4,
+        "127.0.0.1",
+        port,
+        endpoint.split(":")[0],
+        port,
+        sender=False,
+        calibration_path=str(tmp_path / "tables.npz"),
+        adaptive=True,
+        default_prefix_length=4,
     )
     sender = VerdictAdaptiveTransport(
-        "127.0.0.1", port, "127.0.0.1", port, sender=True,
-        calibration_path=str(tmp_path / "tables.npz"), adaptive=True, default_prefix_length=4,
+        "127.0.0.1",
+        port,
+        "127.0.0.1",
+        port,
+        sender=True,
+        calibration_path=str(tmp_path / "tables.npz"),
+        adaptive=True,
+        default_prefix_length=4,
     )
     received: list[torch.Tensor] = []
     ready = threading.Event()
@@ -117,12 +135,22 @@ def test_transport_full_residual_is_exact(tmp_path):
         probe.bind(("127.0.0.1", 0))
         port = probe.getsockname()[1]
     receiver = VerdictAdaptiveTransport(
-        "127.0.0.1", port, "127.0.0.1", port, sender=False,
-        calibration_path=str(tmp_path / "tables.npz"), adaptive=False,
+        "127.0.0.1",
+        port,
+        "127.0.0.1",
+        port,
+        sender=False,
+        calibration_path=str(tmp_path / "tables.npz"),
+        adaptive=False,
     )
     sender = VerdictAdaptiveTransport(
-        "127.0.0.1", port, "127.0.0.1", port, sender=True,
-        calibration_path=str(tmp_path / "tables.npz"), adaptive=False,
+        "127.0.0.1",
+        port,
+        "127.0.0.1",
+        port,
+        sender=True,
+        calibration_path=str(tmp_path / "tables.npz"),
+        adaptive=False,
     )
     received: list[torch.Tensor] = []
 

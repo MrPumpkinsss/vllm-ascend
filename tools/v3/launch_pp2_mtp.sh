@@ -16,9 +16,10 @@ SERVED_MODEL=${V3_SERVED_MODEL:-qwen35-v3-mtp}
 CALIBRATION=${V3_CALIBRATION:-/home/m7zhang/code/v2/results/e17_nvfp4_v3_tables.npz}
 API_PORT=${V3_API_PORT:-31003}
 TRANSPORT_PORT=${V3_TRANSPORT_PORT:-29621}
+RUNTIME_TRACE=${V3_RUNTIME_TRACE:-/tmp/vllm-v3-runtime.jsonl}
 V3_CONFIG=$(printf \
-  '{"v3_verdict_adaptive":{"enabled":true,"calibration":"%s","listen":"127.0.0.1:%s","connect":"127.0.0.1:%s","prefix_repair":false,"prefix_length":8,"serialize_spec":true}}' \
-  "$CALIBRATION" "$TRANSPORT_PORT" "$TRANSPORT_PORT")
+  '{"v3_verdict_adaptive":{"enabled":true,"calibration":"%s","listen":"127.0.0.1:%s","connect":"127.0.0.1:%s","prefix_repair":false,"prefix_length":8,"serialize_spec":true,"runtime_trace":"%s"}}' \
+  "$CALIBRATION" "$TRANSPORT_PORT" "$TRANSPORT_PORT" "$RUNTIME_TRACE")
 SPEC_CONFIG='{"method":"mtp","num_speculative_tokens":7}'
 
 exec python -m vllm.entrypoints.openai.api_server \

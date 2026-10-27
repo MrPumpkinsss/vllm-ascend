@@ -17,8 +17,20 @@ of the V3 bridge for Qwen3.5-family 27B + native recurrent MTP.
   - Anchor arrival is a separate event from exact residual arrival.
   - A receiver callback can run approximate DV work while residual transfer is pending.
   - Selective suffix repair is covered by unit tests.
+  - Stage A now sends the anchor before encoding any residual row. Requested rows are
+    encoded only after the anchor wave, so approximate work can overlap residual work.
   - The stock vLLM worker deliberately requests all rows: vLLM does not yet expose
     a VV-verdict callback before returning the activation tensor to stage B.
+- `vllm_ascend.v3.fast_huffman` and `huffman_fast.cpp`
+  - Native canonical-Huffman encoder and 16-bit LUT decoder with a long-code fallback.
+  - Same wire format as the Python codec; Python remains an exact fallback.
+- `vllm_ascend.v3.runtime`
+  - Prefix policy with P4/P6/full and selective-NACK statistics.
+  - Single-owner transactional state ledger (SOTS): approximate state can never be promoted.
+  - Append-only event trace, trajectory keys, and commit records.
+  - Depth-one binary Ready-Flow admission controller.
+  - The stage-B vLLM model runner records `boundary_open`, `exact_decode_done`, and
+    `commit` events into this ledger after exact target verification.
 - `vllm_ascend.patch.platform.patch_pp_mtp`
   - Fixes PP2+MTP correctness by serializing EngineCore scheduler batches for V3.
   - Upstream PP normally keeps a batch queue of depth PP; it can schedule stage A
@@ -26,7 +38,7 @@ of the V3 bridge for Qwen3.5-family 27B + native recurrent MTP.
     `-1` placeholders and corrupts target state. V3 forces one in-flight scheduler
     batch and disables async scheduling for this mode.
 
-The safe serving path is therefore:
+The complete correctness-first serving path is therefore:
 
 ```text
 stage A: prefix target -> NVFP4 anchor + full exact residual over TCP
@@ -34,9 +46,9 @@ stage B: recover BF16 bitwise -> target VV -> native MTP K=8 drafting
 commit: only normal vLLM target verification output
 ```
 
-This is an exact transport and scheduler correctness bridge, not yet an E2E
-throughput claim. Approximate DV, SOTS state promotion, A runahead, fused
-`VV(t)+DV(t+1)`, and engine Prefix-Repair remain scheduler work.
+This path includes the complete runtime ledger, but approximate DV work, A
+runahead, fused `VV(t)+DV(t+1)`, and engine selective Prefix-Repair remain
+disabled because vLLM has no pre-residual VV callback at the worker boundary.
 
 ## Build calibration
 
@@ -81,15 +93,23 @@ curl http://127.0.0.1:31003/v1/completions \
   native HCCL PP2+MTP also failed, showing that the bug was upstream scheduler
   coordination rather than the exact codec.
 - After serialization, a 32-token code prompt produced coherent output in 9.7s.
-- The 4-task × 4-prompt HTTP probe completed 512 output tokens:
+- Native codec benchmark over 23 E12 blocks × 5 repeats:
+  - encode p50 **11.24 ms/block**, p90 13.38 ms
+  - decode p50 **9.41 ms/block**, p90 10.55 ms
+  - every BF16 block remains exact
+- The Python codec initially gave 4.01 sequential output tok/s. The native codec
+  plus anchor-first residual encoding raised the same 4-task × 4-prompt probe to:
   - 110 draft rounds
-  - mean accepted drafts 3.755
-  - mean committed length including bonus 4.755
-  - full 7/7 survival 32.73%
-  - median request latency 8.05s
-  - 4.01 sequential output tok/s in this correctness-first Python codec prototype
+  - mean accepted drafts **3.755**
+  - mean committed length including bonus **4.755**
+  - full 7/7 survival **32.73%**
+  - median request latency **1.51s**
+  - **21.34 sequential output tok/s**
+- The SOTS trace recorded 405 events and 135 exact commits over the probe;
+  accepted-draft histogram was `{0:37, 1:11, 2:18, 3:8, 4:14, 5:6, 6:2, 7:39}`.
+- Cumulative transport remained 26.29% below BF16.
 
-The acceptance length now matches the engine-level native-MTP semantics and is
-no longer the low offline/reset-KV spectrum. Current throughput is intentionally
-limited by serialized PP scheduling and the Python Huffman implementation; it is
-not the final V3 performance target.
+The acceptance length matches engine-level native-MTP semantics and is no longer
+the low offline/reset-KV spectrum. Current throughput is still bounded by the
+correctness-first serialized PP scheduler; approximate DV, runahead, fused
+execution, and engine Prefix-Repair are the remaining performance mechanisms.

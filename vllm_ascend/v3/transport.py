@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+# ruff: noqa: E402
+
 """Two-wave V3 PP2 transport: anchor/DV first, exact residual/VV second.
 
 The transport deliberately exposes anchor arrival as a separate event.  A
@@ -34,9 +36,10 @@ class V3TransportConfig:
     calibration_path: str = ""
     adaptive: bool = False
     prefix_length: int = 8
+    runtime_trace: str = ""
 
     @classmethod
-    def from_env(cls) -> "V3TransportConfig":
+    def from_env(cls) -> V3TransportConfig:
         return cls(
             enabled=os.environ.get("VLLM_ASCEND_V3_VERDICT_ADAPTIVE", "0") == "1",
             listen=os.environ.get("VLLM_ASCEND_V3_LISTEN", "127.0.0.1:29600"),
@@ -47,7 +50,7 @@ class V3TransportConfig:
         )
 
     @classmethod
-    def from_vllm_config(cls, additional_config: dict[str, Any] | None) -> "V3TransportConfig":
+    def from_vllm_config(cls, additional_config: dict[str, Any] | None) -> V3TransportConfig:
         """Read the spawn-safe vLLM `--additional-config` representation.
 
         Environment variables are convenient for single-process probes, but
@@ -66,6 +69,7 @@ class V3TransportConfig:
         config.calibration_path = str(raw.get("calibration", config.calibration_path))
         config.adaptive = bool(raw.get("prefix_repair", config.adaptive))
         config.prefix_length = int(raw.get("prefix_length", config.prefix_length))
+        config.runtime_trace = str(raw.get("runtime_trace", config.runtime_trace))
         return config
 
 
@@ -76,9 +80,12 @@ class _SemanticBoundary:
     dtype: str
     device: str
     anchor: bytes
-    residuals: list[bytes]
+    exact: torch.Tensor
     prediction: torch.Tensor
-    escape_rate: float
+    anchor_code: Any
+    residuals: list[bytes] = field(default_factory=list)
+    encoded_rows: int = 0
+    escape_rate: float = 0.0
 
 
 @dataclass
@@ -144,20 +151,28 @@ class VerdictAdaptiveTransport:
         self.approximate_seconds = 0.0
 
     @classmethod
-    def from_config(cls, config: V3TransportConfig, *, sender: bool) -> "VerdictAdaptiveTransport | None":
+    def from_config(cls, config: V3TransportConfig, *, sender: bool) -> VerdictAdaptiveTransport | None:
         if not config.enabled:
             return None
         listen_host, listen_port = config.listen.rsplit(":", 1)
         connect_host, connect_port = config.connect.rsplit(":", 1)
         LOGGER.info(
             "V3 transport enabled: role=%s listen=%s connect=%s adaptive=%s calibration=%s",
-            "sender" if sender else "receiver", config.listen, config.connect,
-            config.adaptive, config.calibration_path,
+            "sender" if sender else "receiver",
+            config.listen,
+            config.connect,
+            config.adaptive,
+            config.calibration_path,
         )
         return cls(
-            listen_host, int(listen_port), connect_host, int(connect_port),
-            sender=sender, calibration_path=config.calibration_path,
-            adaptive=config.adaptive, default_prefix_length=config.prefix_length,
+            listen_host,
+            int(listen_port),
+            connect_host,
+            int(connect_port),
+            sender=sender,
+            calibration_path=config.calibration_path,
+            adaptive=config.adaptive,
+            default_prefix_length=config.prefix_length,
         )
 
     def _ensure_socket(self) -> socket.socket:
@@ -206,6 +221,12 @@ class VerdictAdaptiveTransport:
         )
 
     def _prepare_boundary(self, tensor_dict: dict[str, Any]):
+        """Encode only anchor values before the first wire wave.
+
+        Residual rows are intentionally not encoded yet: stage A sends the
+        anchor immediately and encodes requested exact rows while stage B can
+        consume the approximate operand.
+        """
         entries: list[tuple[str, str, Any]] = []
         semantic: dict[str, _SemanticBoundary] = {}
         anchor_payloads: list[bytes] = []
@@ -213,20 +234,30 @@ class VerdictAdaptiveTransport:
         reference_bytes = 0
         for key, value in tensor_dict.items():
             if self._is_semantic(value):
-                anchor, residuals, prediction, escape_rate = self.codec.encode_rows(value.detach())
+                exact = value.detach()
+                anchor, anchor_code = self.codec.encode_anchor(exact)
+                prediction, decoded_code = self.codec.decode_anchor(anchor, exact.shape, exact.device)
                 boundary = _SemanticBoundary(
-                    key, tuple(value.shape), str(value.dtype).removeprefix("torch."), str(value.device),
-                    anchor, residuals, prediction.detach(), escape_rate,
+                    key,
+                    tuple(exact.shape),
+                    str(exact.dtype).removeprefix("torch."),
+                    str(exact.device),
+                    anchor,
+                    exact.cpu(),
+                    prediction.cpu(),
+                    decoded_code,
                 )
                 semantic[key] = boundary
-                entry = _AnchorEntry(boundary.shape, boundary.dtype, boundary.device, len(anchor), value.shape[0], escape_rate)
+                entry = _AnchorEntry(boundary.shape, boundary.dtype, boundary.device, len(anchor), exact.shape[0], 0.0)
                 entries.append((key, "semantic", entry))
                 anchor_payloads.append(anchor)
                 anchor_bytes += len(anchor)
-                reference_bytes += value.numel() * 2
+                reference_bytes += exact.numel() * 2
             elif isinstance(value, torch.Tensor):
                 payload = self._torch_save(value.detach().cpu())
-                entry = _RawEntry(tuple(value.shape), str(value.dtype).removeprefix("torch."), str(value.device), len(payload))
+                entry = _RawEntry(
+                    tuple(value.shape), str(value.dtype).removeprefix("torch."), str(value.device), len(payload)
+                )
                 entries.append((key, "raw", entry))
                 anchor_payloads.append(payload)
                 anchor_bytes += len(payload)
@@ -234,6 +265,19 @@ class VerdictAdaptiveTransport:
             else:
                 entries.append((key, "object", value))
         return entries, semantic, b"".join(anchor_payloads), anchor_bytes, reference_bytes
+
+    def _encode_residual_rows(self, boundary: _SemanticBoundary, rows: int) -> list[bytes]:
+        rows = min(max(rows, boundary.encoded_rows), int(boundary.exact.shape[0]))
+        while boundary.encoded_rows < rows:
+            row = boundary.encoded_rows
+            prediction = boundary.prediction[row : row + 1].to(boundary.exact.device)
+            exact = boundary.exact[row : row + 1].to(boundary.exact.device)
+            code = boundary.anchor_code[row : row + 1]
+            payload, escape_rate = self.codec.encode_residual(prediction, exact, code)
+            boundary.residuals.append(payload)
+            boundary.encoded_rows += 1
+            boundary.escape_rate = escape_rate
+        return boundary.residuals[:rows]
 
     def send_tensor_dict(self, tensor_dict: dict[str, Any]) -> None:
         started = time.perf_counter()
@@ -262,8 +306,8 @@ class VerdictAdaptiveTransport:
                 if kind != "semantic":
                     continue
                 boundary = semantic[key]
-                end = min(max(requested, 0), len(boundary.residuals))
-                payloads = boundary.residuals[:end]
+                end = min(max(requested, 0), int(boundary.exact.shape[0]))
+                payloads = self._encode_residual_rows(boundary, end)
                 selected.append((key, boundary, payloads))
                 residual_payloads.extend(payloads)
                 residual_bytes += sum(map(len, payloads))
@@ -334,11 +378,11 @@ class VerdictAdaptiveTransport:
         self.decode_seconds += time.perf_counter() - started
         return result, metadata
 
-    def _request_residual(self, prefix_length: int, metadata: dict[str, Any], *, kind: str = "RESIDUAL_REQUEST") -> tuple[dict[str, Any], bytes]:
+    def _request_residual(
+        self, prefix_length: int, metadata: dict[str, Any], *, kind: str = "RESIDUAL_REQUEST"
+    ) -> tuple[dict[str, Any], bytes]:
         sock = self._ensure_socket()
-        lengths: dict[str, int] = {
-            key: min(prefix_length, entry.rows) for key, entry in metadata["entries"].items()
-        }
+        lengths: dict[str, int] = {key: min(prefix_length, entry.rows) for key, entry in metadata["entries"].items()}
         send_frame(sock, kind, {"version": 1, "prefix_length": prefix_length, "lengths": lengths})
         frame = recv_frame(sock)
         if frame.kind != "RESIDUAL":

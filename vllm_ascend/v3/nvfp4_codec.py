@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+# ruff: noqa: E402
+
 """Exact NVFP4 activation codec for the V3 split-boundary protocol.
 
 The first wave is a signed e2m1 value plus one e4m3 scale per 16 channels
@@ -12,13 +14,14 @@ BF16 code exactly.
 
 import heapq
 import json
-import math
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
 
 import numpy as np
 import torch
+
+from .fast_huffman import NativeHuffmanCodec
 
 FP4_BLOCK = 16
 FP4_POSITIVE = np.asarray([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], dtype=np.float32)
@@ -122,6 +125,7 @@ class NVFP4ExactCodec:
         self.tables: list[list[str]] | None = None
         self.decoders: list[dict[str, int]] | None = None
         self.max_code_length = 0
+        self.native_huffman: NativeHuffmanCodec | None = None
         if self.config.calibration_path:
             self.load(self.config.calibration_path)
 
@@ -133,7 +137,9 @@ class NVFP4ExactCodec:
 
     def encode_anchor(self, tensor: torch.Tensor) -> tuple[bytes, np.ndarray]:
         if tensor.dtype != torch.bfloat16 or tensor.shape[-1] != self.config.hidden_size:
-            raise ValueError(f"expected BF16 [..., {self.config.hidden_size}], got {tuple(tensor.shape)} {tensor.dtype}")
+            raise ValueError(
+                f"expected BF16 [..., {self.config.hidden_size}], got {tuple(tensor.shape)} {tensor.dtype}"
+            )
         n = self._tokens(tensor)
         blocks = self.config.hidden_size // FP4_BLOCK
         z = tensor.detach().cpu().float().numpy().reshape(n, blocks, FP4_BLOCK)
@@ -189,7 +195,7 @@ class NVFP4ExactCodec:
         symbols[representable] = (delta[representable] + MAX_RANK_DELTA).astype(np.uint16)
         return symbols, x, p, representable
 
-    def fit(self, samples: Iterable[torch.Tensor]) -> "NVFP4ExactCodec":
+    def fit(self, samples: Iterable[torch.Tensor]) -> NVFP4ExactCodec:
         counts = np.zeros((16, NUM_SYMBOLS), dtype=np.float64)
         elements = 0
         for sample in samples:
@@ -213,6 +219,7 @@ class NVFP4ExactCodec:
             self.max_code_length = max(self.max_code_length, max(map(len, codes)))
             self.tables.append(codes)
             self.decoders.append({code: symbol for symbol, code in enumerate(codes)})
+        self.native_huffman = NativeHuffmanCodec(self.tables, self.max_code_length)
         return self
 
     def save(self, path: str | Path) -> None:
@@ -223,11 +230,9 @@ class NVFP4ExactCodec:
             "hidden_size": self.config.hidden_size,
             "max_code_length": self.max_code_length,
         }
-        np.savez_compressed(
-            Path(path), tables=np.asarray(self.tables, dtype=str), metadata=json.dumps(metadata)
-        )
+        np.savez_compressed(Path(path), tables=np.asarray(self.tables, dtype=str), metadata=json.dumps(metadata))
 
-    def load(self, path: str | Path) -> "NVFP4ExactCodec":
+    def load(self, path: str | Path) -> NVFP4ExactCodec:
         with np.load(Path(path), allow_pickle=False) as archive:
             metadata = json.loads(str(archive["metadata"].item()))
             if metadata.get("format") != "vllm-ascend-v3-nvfp4":
@@ -240,13 +245,19 @@ class NVFP4ExactCodec:
         self.tables = tables.tolist()
         self.decoders = [{code: symbol for symbol, code in enumerate(row)} for row in self.tables]
         self.max_code_length = max(len(code) for row in self.tables for code in row)
+        self.native_huffman = NativeHuffmanCodec(self.tables, self.max_code_length)
         return self
 
-    def encode_residual(self, prediction: torch.Tensor, exact: torch.Tensor, anchor_code: np.ndarray) -> tuple[bytes, float]:
+    def encode_residual(
+        self, prediction: torch.Tensor, exact: torch.Tensor, anchor_code: np.ndarray
+    ) -> tuple[bytes, float]:
         if self.tables is None:
             raise RuntimeError("NVFP4 residual coder is not calibrated")
         symbols, exact_codes, _, representable = self._symbols(prediction, exact)
         context = anchor_code.reshape(-1).astype(np.int64)
+        if self.native_huffman is not None and self.native_huffman.available:
+            payload = self.native_huffman.encode(context, symbols, exact_codes)
+            return payload, float(1.0 - representable.mean())
         writer = _BitWriter()
         for ctx, symbol, represented, code in zip(context, symbols, representable, exact_codes):
             writer.write(self.tables[int(ctx)][int(symbol)])
@@ -261,22 +272,33 @@ class NVFP4ExactCodec:
             raise RuntimeError("NVFP4 residual coder is not calibrated")
         predicted_codes = self._codes(prediction).reshape(-1)
         context = anchor_code.reshape(-1).astype(np.int64)
-        reader = _BitReader(payload)
-        output = np.empty(len(context), dtype=np.uint16)
-        for index in range(len(context)):
-            prefix, symbol, decoder = "", None, self.decoders[int(context[index])]
-            while symbol is None:
-                prefix += reader.bit()
-                symbol = decoder.get(prefix)
-                if len(prefix) > self.max_code_length:
-                    raise ValueError("invalid NVFP4 residual Huffman prefix")
-            if symbol == ESCAPE_SYMBOL:
-                output[index] = reader.raw16()
-            else:
-                rank = int(RANK_TABLE[int(predicted_codes[index])]) + int(symbol) - MAX_RANK_DELTA
-                if not 0 <= rank < len(FINITE_CODES):
-                    raise ValueError("decoded BF16 rank is out of range")
-                output[index] = FINITE_CODES[rank]
+        if self.native_huffman is not None and self.native_huffman.available:
+            decoded, escape_codes, _ = self.native_huffman.decode_symbols(payload, context)
+            rank = RANK_TABLE[predicted_codes].astype(np.int32) + decoded.astype(np.int32) - MAX_RANK_DELTA
+            escaped = decoded == ESCAPE_SYMBOL
+            bounded = (~escaped) & (rank >= 0) & (rank < len(FINITE_CODES))
+            if not bool(np.all(escaped | bounded)):
+                raise ValueError("decoded BF16 rank is out of range")
+            output = np.empty(len(context), dtype=np.uint16)
+            output[escaped] = escape_codes[escaped]
+            output[~escaped] = FINITE_CODES[rank[~escaped]]
+        else:
+            reader = _BitReader(payload)
+            output = np.empty(len(context), dtype=np.uint16)
+            for index in range(len(context)):
+                prefix, symbol, decoder = "", None, self.decoders[int(context[index])]
+                while symbol is None:
+                    prefix += reader.bit()
+                    symbol = decoder.get(prefix)
+                    if len(prefix) > self.max_code_length:
+                        raise ValueError("invalid NVFP4 residual Huffman prefix")
+                if symbol == ESCAPE_SYMBOL:
+                    output[index] = reader.raw16()
+                else:
+                    rank = int(RANK_TABLE[int(predicted_codes[index])]) + int(symbol) - MAX_RANK_DELTA
+                    if not 0 <= rank < len(FINITE_CODES):
+                        raise ValueError("decoded BF16 rank is out of range")
+                    output[index] = FINITE_CODES[rank]
         tensor = torch.from_numpy(output.copy()).view(torch.bfloat16).reshape(shape)
         return tensor.to(device=device, dtype=torch.bfloat16)
 
@@ -290,7 +312,9 @@ class NVFP4ExactCodec:
         prediction, code = self.decode_anchor(anchor, shape, device)
         return self.decode_residual(prediction, code, residual, shape, device)
 
-    def encode_rows(self, tensor: torch.Tensor, rows: range | list[int] | None = None) -> tuple[bytes, list[bytes], torch.Tensor, float]:
+    def encode_rows(
+        self, tensor: torch.Tensor, rows: range | list[int] | None = None
+    ) -> tuple[bytes, list[bytes], torch.Tensor, float]:
         """Encode all anchor rows and independent residual streams for selected rows."""
         anchor, code = self.encode_anchor(tensor)
         prediction, decoded_code = self.decode_anchor(anchor, tensor.shape, tensor.device)
@@ -338,9 +362,9 @@ def fit_calibration_archive(archive_path: str | Path, output_path: str | Path) -
             if raw.ndim == 1:
                 raw = raw.reshape(-1, NVFP4CodecConfig().hidden_size)
             samples.append(
-                torch.from_numpy(raw.astype(np.int16).copy()).view(torch.bfloat16).reshape(
-                    raw.shape[0], NVFP4CodecConfig().hidden_size
-                )
+                torch.from_numpy(raw.astype(np.int16).copy())
+                .view(torch.bfloat16)
+                .reshape(raw.shape[0], NVFP4CodecConfig().hidden_size)
             )
     codec = NVFP4ExactCodec().fit(samples)
     codec.save(output_path)
